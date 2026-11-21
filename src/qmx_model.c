@@ -1,3 +1,8 @@
+/*
+ * Copyright 2026 1WhiteFox
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #if !defined(_WIN32) && !defined(__DJGPP__)
     #ifndef _POSIX_C_SOURCE
         #define _POSIX_C_SOURCE 200809L

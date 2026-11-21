@@ -1,3 +1,8 @@
+/*
+ * Copyright 2026 1WhiteFox
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "../include/qmx_sampler.h"
 #include "../include/qmx_runtime.h"
 #include <string.h>

@@ -1,3 +1,8 @@
+/*
+ * Copyright 2026 1WhiteFox
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif

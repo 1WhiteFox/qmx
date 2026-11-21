@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 1WhiteFox
+# SPDX-License-Identifier: Apache-2.0
 import argparse
 import os
 import re

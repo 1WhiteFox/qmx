@@ -1,3 +1,8 @@
+/*
+ * Copyright 2026 1WhiteFox
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "../include/qmx_kernels.h"
 
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))

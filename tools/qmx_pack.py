@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 1WhiteFox
+# SPDX-License-Identifier: Apache-2.0
 """
 QMX Forge Packer v1.1a
 Converts HuggingFace SafeTensors (LLaMA, SmolLM, BitNet b1.58, Qwen-2/3, Gemma-2/3, Phi-3/4),

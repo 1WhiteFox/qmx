@@ -1,3 +1,8 @@
+/*
+ * Copyright 2026 1WhiteFox
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifdef QMX_TEST_AMALGAMATED
 #include "qmx.h"
 #else

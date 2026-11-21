@@ -1,3 +1,8 @@
+/*
+ * Copyright 2026 1WhiteFox
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "../include/qmx_kernels.h"
 
 #if defined(QMX_ENABLE_BACKEND_3DNOW) && (defined(__i386__) || defined(__x86_64__)) && (defined(__3dNOW__) || defined(__3dnow__))
