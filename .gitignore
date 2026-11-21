@@ -1,0 +1,24 @@
+# Build & distribution artifacts
+build/
+dist/
+dist_retro/
+*.o
+*.a
+*.exe
+qmx
+qmx-term
+qmx_p54c
+qmx_mmx
+qmx_3dnow
+QMX.CFG
+
+# Model weights & tokenizer caches
+*.qmx
+*.bin
+*.gguf
+*.safetensors
+
+# Python & repomix snapshots
+__pycache__/
+*.pyc
+*repomix*.xml
