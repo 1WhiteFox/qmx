@@ -24,6 +24,7 @@ LIBQMX_SAN  = build/san/libqmx_san.a
 WIN64_OBJS  = $(patsubst src/%.c,build/win64/%.o,$(CORE_SRCS) $(KERNEL_SRCS))
 
 CFLAGS_STD  = -std=c99 -Wall -Wextra -Iinclude -fno-builtin
+HOST_ARCH_FLAGS ?= $(if $(filter x86_64,$(shell uname -m 2>/dev/null)),-march=x86-64,)
 HOST_FLAGS  = -DQMX_USE_MMAP -DQMX_ENABLE_THREADS -DQMX_ENABLE_DYNAMIC_PLUGINS -pthread
 HOST_LIBS   = -ldl
 
@@ -43,19 +44,19 @@ build/host:
 > mkdir -p build/host
 
 build/host/qmx_%.o: src/qmx_%.c $(HEADERS) | build/host
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O3 -c $< -o $@
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O3 -c $< -o $@
 
 build/host/kernels_%.o: src/kernels_%.c $(HEADERS) | build/host
-> $(CC) $(CFLAGS_STD) -O3 -c $< -o $@
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) -O3 -c $< -o $@
 
 build/san:
 > mkdir -p build/san
 
 build/san/qmx_%.o: src/qmx_%.c $(HEADERS) | build/san
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) -c $< -o $@
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) -c $< -o $@
 
 build/san/kernels_%.o: src/kernels_%.c $(HEADERS) | build/san
-> $(CC) $(CFLAGS_STD) $(SAN_FLAGS) -c $< -o $@
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(SAN_FLAGS) -c $< -o $@
 
 $(LIBQMX_SAN): $(SAN_OBJS)
 > rm -f $@
@@ -177,27 +178,27 @@ test: host plugins
 > python3 tools/qmx_pack.py --dummy -q q8 -o test_q8.qmx
 > python3 tools/qmx_pack.py --info test_q4.qmx
 > python3 tests/test_packer.py
-> $(CC) $(CFLAGS_STD) -O2 tests/test_ops.c $(LIBQMX) -lm -pthread $(HOST_LIBS) -o build/host/test_ops
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) -O2 tests/test_ops.c $(LIBQMX) -lm -pthread $(HOST_LIBS) -o build/host/test_ops
 > ./build/host/test_ops
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_vm.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_vm
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_vm.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_vm
 > ./build/host/test_vm test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_simd.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_simd
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_simd.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_simd
 > ./build/host/test_simd test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_tokenizer.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_tokenizer
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_tokenizer.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_tokenizer
 > ./build/host/test_tokenizer test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_security_and_stress.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_security_and_stress
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_security_and_stress.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_security_and_stress
 > ./build/host/test_security_and_stress test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_reader.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_reader
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_reader.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_reader
 > ./build/host/test_reader test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_gen.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_gen
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_gen.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_gen
 > ./build/host/test_gen test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_xip_15k.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_xip_15k
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_xip_15k.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_xip_15k
 > ./build/host/test_xip_15k
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_plugin.c plugins/plugin_layer_profiler.c plugins/plugin_token_ban.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_plugin
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_plugin.c plugins/plugin_layer_profiler.c plugins/plugin_token_ban.c $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_plugin
 > ./build/host/test_plugin test_q4.qmx build/plugins
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_profiles.c $(APP_COMMON) $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_profiles
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_profiles.c $(APP_COMMON) $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_profiles
 > ./build/host/test_profiles
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_session.c $(APP_COMMON) $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_session
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_session.c $(APP_COMMON) $(LIBQMX) -lm $(HOST_LIBS) -o build/host/test_session
 > ./build/host/test_session
 > ./qmx -m test_q4.qmx -p "Hello" -n 16 -b auto --verify-crc
 > ./qmx -m test_ternary.qmx -p "Hello" -n 16 -b mmx --stream --kv8
@@ -209,29 +210,29 @@ test: host plugins
 
 test-san: $(LIBQMX_SAN) plugins
 > @test -f test_q4.qmx || python3 tools/qmx_pack.py --dummy -q q4 -o test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(SAN_FLAGS) tests/test_ops.c $(LIBQMX_SAN) -lm -pthread $(HOST_LIBS) -o build/san/test_ops
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(SAN_FLAGS) tests/test_ops.c $(LIBQMX_SAN) -lm -pthread $(HOST_LIBS) -o build/san/test_ops
 > ./build/san/test_ops
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_vm.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_vm
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_vm.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_vm
 > ./build/san/test_vm test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_simd.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_simd
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_simd.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_simd
 > ./build/san/test_simd test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_tokenizer.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_tokenizer
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_tokenizer.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_tokenizer
 > ./build/san/test_tokenizer test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_security_and_stress.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_security_and_stress
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_security_and_stress.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_security_and_stress
 > ./build/san/test_security_and_stress test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_reader.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_reader
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_reader.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_reader
 > ./build/san/test_reader test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_gen.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_gen
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_gen.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_gen
 > ./build/san/test_gen test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_xip_15k.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_xip_15k
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_xip_15k.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_xip_15k
 > ./build/san/test_xip_15k
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_plugin.c plugins/plugin_layer_profiler.c plugins/plugin_token_ban.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_plugin
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_plugin.c plugins/plugin_layer_profiler.c plugins/plugin_token_ban.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_plugin
 > ./build/san/test_plugin test_q4.qmx build/plugins
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_profiles.c $(APP_COMMON) $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_profiles
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_profiles.c $(APP_COMMON) $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_profiles
 > ./build/san/test_profiles
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_session.c $(APP_COMMON) $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_session
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/test_session.c $(APP_COMMON) $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/test_session
 > ./build/san/test_session
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/fuzz_loader.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/fuzz_loader
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) $(SAN_FLAGS) tests/fuzz_loader.c $(LIBQMX_SAN) -lm $(HOST_LIBS) -o build/san/fuzz_loader
 > ./build/san/fuzz_loader test_q4.qmx
 > @echo "[PASS] ASan + UBSan suite passed across all 11 test binaries + 1500-case loader fuzzer!"
 
@@ -263,17 +264,17 @@ amalgamate:
 test-amalgamate: amalgamate
 > @test -f test_q4.qmx || python3 tools/qmx_pack.py --dummy -q q4 -o test_q4.qmx
 > mkdir -p build/amalg
-> $(CC) -std=c99 -Wall -Wextra -Idist -fno-builtin -DQMX_USE_MMAP -DQMX_ENABLE_THREADS -pthread -O3 -c dist/qmx.c -o build/amalg/qmx_host.o
-> $(CC) -std=c99 -Wall -Wextra -Idist -fno-builtin -DQMX_USE_MMAP -DQMX_ENABLE_THREADS -pthread -O3 examples/minimal_step.c build/amalg/qmx_host.o -o build/amalg/minimal_step
+> $(CC) $(HOST_ARCH_FLAGS) -std=c99 -Wall -Wextra -Idist -fno-builtin -DQMX_USE_MMAP -DQMX_ENABLE_THREADS -pthread -O3 -c dist/qmx.c -o build/amalg/qmx_host.o
+> $(CC) $(HOST_ARCH_FLAGS) -std=c99 -Wall -Wextra -Idist -fno-builtin -DQMX_USE_MMAP -DQMX_ENABLE_THREADS -pthread -O3 examples/minimal_step.c build/amalg/qmx_host.o -o build/amalg/minimal_step
 > ./build/amalg/minimal_step test_q4.qmx "Hello"
 > ./build/amalg/minimal_step test_q4.qmx "Hello" --reader
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_vm.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_vm
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_vm.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_vm
 > ./build/amalg/test_vm test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_simd.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_simd
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_simd.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_simd
 > ./build/amalg/test_simd test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_reader.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_reader
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_reader.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_reader
 > ./build/amalg/test_reader test_q4.qmx
-> $(CC) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_gen.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_gen
+> $(CC) $(HOST_ARCH_FLAGS) $(CFLAGS_STD) $(HOST_FLAGS) -O2 tests/test_gen.c build/amalg/qmx_host.o -lm $(HOST_LIBS) -o build/amalg/test_gen
 > ./build/amalg/test_gen test_q4.qmx
 > $(CC) -std=c99 -Wall -Wextra -Idist -fno-builtin -DQMX_NO_STDIO -DQMX_NO_MALLOC -DQMX_NO_THREADS -DQMX_NO_MMAP -DQMX_NO_SIMD -DQMX_NO_CUSTOM_BACKENDS -DQMX_NO_PLUGINS -O2 -c dist/qmx.c -o build/amalg/qmx_mcu.o
 > @! nm -u build/amalg/qmx_mcu.o | grep -E '\b(malloc|calloc|realloc|free|fopen|fread|fseek|fseeko|ftell|ftello|printf|fprintf)\b' || (echo "[ERROR] Forbidden heap/stdio symbol in amalgamated MCU build!" && exit 1)
