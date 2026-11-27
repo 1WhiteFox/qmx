@@ -11,6 +11,7 @@
 #include "../../include/qmx_kernels.h"
 #include "../../include/qmx_tokenizer.h"
 #include "../../include/qmx_gen.h"
+#include "../../include/qmx_plugin.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,10 +37,18 @@ typedef struct {
     uint32_t cfg_offset;
     char     magic[4];
 } QmxBundleTrailer;
+
+typedef struct {
+    uint64_t bundle_offset;
+    uint64_t bundle_size;
+    uint64_t cfg_offset;
+    char     magic[4];
+} QmxBundleTrailer64;
 #pragma pack(pop)
 
 typedef char assert_qmx_rt_cfg_64b[(sizeof(QmxRuntimeCfg) == 64) ? 1 : -1];
 typedef char assert_qmx_trailer_16b[(sizeof(QmxBundleTrailer) == 16) ? 1 : -1];
+typedef char assert_qmx_trailer64_28b[(sizeof(QmxBundleTrailer64) == 28) ? 1 : -1];
 
 typedef enum {
     QMX_CHAT_NONE   = 0,
@@ -59,6 +68,10 @@ void            qmx_app_utf8_printer_reset(QmxUtf8Printer *p);
 void            qmx_app_safe_print(QmxUtf8Printer *p, const char *piece);
 float           qmx_app_time_ms(void);
 const char     *qmx_app_quant_label(uint16_t q);
+int             qmx_app_parse_i32(const char *s, int min_v, int max_v, int fallback);
+uint32_t        qmx_app_parse_u32(const char *s, uint32_t max_v, uint32_t fallback);
+uint64_t        qmx_app_parse_u64(const char *s, uint64_t max_v, uint64_t fallback);
+float           qmx_app_parse_f32(const char *s, float min_v, float max_v, float fallback);
 QmxBackend      qmx_app_parse_backend(const char *s);
 QmxBackend      qmx_app_cycle_backend(QmxBackend cur);
 QmxChatTemplate qmx_app_detect_chat_template(const QmxTokenizer *tok, int has_tok);
@@ -71,6 +84,10 @@ int qmx_app_probe_self_bundle(const char *exe_path, uint64_t *out_mod_off, uint6
 
 void qmx_app_reload_tokenizer(const QmxModelInfo *info, const char *active_path, uint64_t base_offset,
                               const char *fallback_tok_path, QmxTokenizer *tok, int *has_tok);
+int  qmx_app_load_uri_model(const char *uri, const QmxLoadParams *lp,
+                            QmxModel *model, QmxTokenizer *tok, int *has_tok);
+int  qmx_app_load_uri_model_ex(const char *uri, const QmxLoadParams *lp, int verify_crc,
+                               QmxModel *model, QmxTokenizer *tok, int *has_tok);
 
 int qmx_app_run_cli(QmxModel *model, const QmxTokenizer *tok, int has_tok,
                     const char *prompt, const QmxGenParams *params, int debug_tokens);

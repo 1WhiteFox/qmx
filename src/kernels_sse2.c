@@ -154,7 +154,7 @@ static void sse2_matmul_tiled(float         * QMX_RESTRICT out,
     __m128i mask0f = _mm_set1_epi8(0x0F);
     __m128i bias8 = _mm_set1_epi16(8);
 
-    float tile_acc[QMX_TILE_ROWS] QMX_ALIGNED(16);
+    QMX_ALIGNED(16) float tile_acc[QMX_TILE_ROWS];
 
     for (uint32_t tr = 0; tr < n_tr; tr++) {
         uint32_t r_base = tr * QMX_TILE_ROWS;
@@ -317,6 +317,11 @@ const QmxBackendOps qmx_ops_sse2 = {
     NULL,
     qmx_swiglu_quant_scalar,
     qmx_f16_to_f32_scalar,
-    qmx_f32_to_f16_scalar
+    qmx_f32_to_f16_scalar,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 #endif

@@ -184,15 +184,20 @@ static void verify_backend_ops(QmxBackend backend, const QmxBackendOps *ops, con
         check_near(ops->name, y_got[i], y_ref[i], 1e-4f);
     }
 
-    int8_t xq_ref[64] QMX_ALIGNED(64);
-    int16_t xq16_ref[64] QMX_ALIGNED(64);
+    QMX_ALIGNED(64) int8_t xq_ref[64];
+    QMX_ALIGNED(64) int16_t xq16_ref[64];
     float xs_ref[2];
     qmx_ops_scalar.prepare_act(x, xq_ref, xq16_ref, xs_ref, cols);
 
-    int8_t xq_got[64] QMX_ALIGNED(64);
-    int16_t xq16_got[64] QMX_ALIGNED(64);
+    QMX_ALIGNED(64) int8_t xq_got[64];
+    QMX_ALIGNED(64) int16_t xq16_got[64];
+    QMX_ALIGNED(64) int8_t xq_eo_got[64];
+    int32_t xsums_got[2];
     float xs_got[2];
     ops->prepare_act(x, xq_got, xq16_got, xs_got, cols);
+    if (ops->prepare_act_eo) {
+        ops->prepare_act_eo(xq_got, xq_eo_got, xsums_got, cols);
+    }
 
     int32_t dq8_ref = qmx_ops_scalar.dot_q8(xq_ref, xq16_ref, k8, cols);
     int32_t dq8_got = ops->dot_q8(xq_got, xq16_got, k8, cols);
@@ -211,11 +216,28 @@ static void verify_backend_ops(QmxBackend backend, const QmxBackendOps *ops, con
         for (uint32_t i = 0; i < cols; i++) {
             check_near(ops->name, f_got[i], f_ref[i], 1e-3f);
         }
+        if (ops->dot_f32_f16) {
+            float df16_ref = qmx_dot_f32_f16_scalar(w_norm, h_ref, cols);
+            float df16_got = ops->dot_f32_f16(w_norm, h_ref, cols);
+            check_near(ops->name, df16_got, df16_ref, 1e-3f);
+        }
+        if (ops->saxpy_f32_f16) {
+            float sy_ref[45], sy_got[45];
+            memcpy(sy_ref, w_norm, cols * sizeof(float));
+            memcpy(sy_got, w_norm, cols * sizeof(float));
+            qmx_saxpy_f32_f16_scalar(sy_ref, 0.375f, h_ref, cols);
+            ops->saxpy_f32_f16(sy_got, 0.375f, h_ref, cols);
+            for (uint32_t i = 0; i < cols; i++) {
+                check_near(ops->name, sy_got[i], sy_ref[i], 1e-3f);
+            }
+        }
     }
 
     if (ops->rmsnorm_quant) {
-        int8_t rq_ref[64] QMX_ALIGNED(64), rq_got[64] QMX_ALIGNED(64);
-        int16_t rq16_ref[64] QMX_ALIGNED(64), rq16_got[64] QMX_ALIGNED(64);
+        QMX_ALIGNED(64) int8_t  rq_ref[64];
+        QMX_ALIGNED(64) int8_t  rq_got[64];
+        QMX_ALIGNED(64) int16_t rq16_ref[64];
+        QMX_ALIGNED(64) int16_t rq16_got[64];
         float rqs_ref[2], rqs_got[2];
         qmx_ops_scalar.prepare_act(rms_ref, rq_ref, rq16_ref, rqs_ref, cols);
         ops->rmsnorm_quant(x, w_norm, rq_got, rq16_got, rqs_got, cols, 1e-5f);
@@ -232,8 +254,10 @@ static void verify_backend_ops(QmxBackend backend, const QmxBackendOps *ops, con
             float gv = x[i];
             sw_ref[i] = gv * (1.0f / (1.0f + qmx_expf(-gv))) * w_norm[i];
         }
-        int8_t sq_ref[64] QMX_ALIGNED(64), sq_got[64] QMX_ALIGNED(64);
-        int16_t sq16_ref[64] QMX_ALIGNED(64), sq16_got[64] QMX_ALIGNED(64);
+        QMX_ALIGNED(64) int8_t  sq_ref[64];
+        QMX_ALIGNED(64) int8_t  sq_got[64];
+        QMX_ALIGNED(64) int16_t sq16_ref[64];
+        QMX_ALIGNED(64) int16_t sq16_got[64];
         float sqs_ref[2], sqs_got[2];
         qmx_ops_scalar.prepare_act(sw_ref, sq_ref, sq16_ref, sqs_ref, cols);
         ops->swiglu_quant(x, w_norm, sq_got, sq16_got, sqs_got, cols);
@@ -277,6 +301,67 @@ static void verify_backend_ops(QmxBackend backend, const QmxBackendOps *ops, con
 
         for (uint32_t r = 0; r < rows; r++) {
             check_near(ops->name, out_got[r], out_ref[r], 1e-4f);
+        }
+
+        if (ops->prepare_act_eo && ops->matmul_tiled_eo) {
+            float out_eo[19];
+            for (uint32_t r = 0; r < rows; r++) out_eo[r] = 1.25f;
+            ops->matmul_tiled_eo(out_eo, xq_got, xq_eo_got, xsums_got, xs_got, &w, 1);
+            for (uint32_t r = 0; r < rows; r++) {
+                check_near(ops->name, out_eo[r], out_ref[r], 1e-4f);
+            }
+        }
+
+        if (ops->prepare_act_eo && ops->matmul_tiled_batch) {
+            enum { TB = 13 };
+            QMX_ALIGNED(64) int8_t  bxq[TB][64];
+            QMX_ALIGNED(64) int16_t bxq16[TB][64];
+            QMX_ALIGNED(64) int8_t  bxq_eo[TB][64];
+            int32_t bxsums[TB][2];
+            float   bxs[TB][2];
+            float   bout_ref[TB][19];
+            float   bout_got[TB][19];
+            float   *dst_p[TB];
+            int8_t  *xq_p[TB];
+            int8_t  *eo_p[TB];
+            int32_t *sum_p[TB];
+            float   *xs_p[TB];
+
+            for (int b = 0; b < TB; b++) {
+                float xb[64];
+                for (uint32_t i = 0; i < 64u; i++) {
+                    seed = seed * 1664525u + 1013904223u;
+                    xb[i] = ((float)((int32_t)(seed >> 8) - 8388608)) / 8388608.0f;
+                }
+                ops->prepare_act(xb, bxq[b], bxq16[b], bxs[b], cols);
+                ops->prepare_act_eo(bxq[b], bxq_eo[b], bxsums[b], cols);
+                dst_p[b] = bout_got[b];
+                xq_p[b]  = bxq[b];
+                eo_p[b]  = bxq_eo[b];
+                sum_p[b] = bxsums[b];
+                xs_p[b]  = bxs[b];
+            }
+
+            const int test_bs[7] = { 1, 2, 4, 5, 8, 9, 13 };
+            for (int acc_m = 0; acc_m < 2; acc_m++) {
+                for (int bi = 0; bi < 7; bi++) {
+                    int B = test_bs[bi];
+                    for (int b = 0; b < B; b++) {
+                        for (uint32_t r = 0; r < rows; r++) {
+                            float init_v = acc_m ? (0.25f * (float)(b + 1) - 0.1f * (float)r) : 99.0f;
+                            bout_ref[b][r] = init_v;
+                            bout_got[b][r] = init_v;
+                        }
+                        qmx_ops_scalar.matmul_tiled(bout_ref[b], bxq[b], bxq16[b], bxs[b], &w, acc_m);
+                    }
+                    ops->matmul_tiled_batch(dst_p, xq_p, eo_p, sum_p, xs_p, B, &w, acc_m);
+                    for (int b = 0; b < B; b++) {
+                        for (uint32_t r = 0; r < rows; r++) {
+                            check_near(ops->name, bout_got[b][r], bout_ref[b][r], 1e-4f);
+                        }
+                    }
+                }
+            }
         }
 
         free(scales);

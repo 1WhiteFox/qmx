@@ -197,7 +197,8 @@ static void test_sampler_and_stop(void) {
         g_failures++;
     }
 
-    float nan_logits[4] = { 0.0f / 0.0f, -1.0f, 3.0f, 0.0f / 0.0f };
+    QmxFloatBits qnan_b; qnan_b.u = 0x7FC00000u;
+    float nan_logits[4] = { qnan_b.f, -1.0f, 3.0f, qnan_b.f };
     if (qmx_sample_argmax(nan_logits, 4) != 2) {
         fprintf(stderr, "[FAIL] Argmax failed to ignore NaN logits\n");
         g_failures++;
@@ -219,6 +220,11 @@ static void test_sampler_and_stop(void) {
     }
     if (qmx_check_stop_sequence(tail, sizeof(tail), "_id|>", 1) != 1) {
         fprintf(stderr, "[FAIL] Failed to detect split <|eot_id|>\n");
+        g_failures++;
+    }
+    tail[0] = '\0';
+    if (qmx_check_stop_sequence(tail, sizeof(tail), "done <|end|>", 0) != 1) {
+        fprintf(stderr, "[FAIL] Failed to detect Phi-3 <|end|> stop sequence\n");
         g_failures++;
     }
 }

@@ -182,6 +182,11 @@ const QmxBackendOps qmx_ops_arm_dsp = {
     qmx_rmsnorm_quant_scalar,
     qmx_swiglu_quant_scalar,
     qmx_f16_to_f32_scalar,
-    qmx_f32_to_f16_scalar
+    qmx_f32_to_f16_scalar,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 #endif

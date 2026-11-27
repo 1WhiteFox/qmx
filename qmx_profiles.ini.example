@@ -1,0 +1,38 @@
+[default]
+threads = auto
+kv = fp16
+prefill_chunk = 32
+temp = 0.0
+top_k = 40
+top_p = 0.90
+rep_penalty = 1.15
+
+[profile.low_ram]
+stream = true
+max_ram_mb = 256
+kv = q8
+threads = 4
+
+[profile.laptop_quiet]
+threads = 4
+kv = fp16
+temp = 0.7
+
+[profile.retro_dos]
+backend = mmx
+kv = q8
+stream = true
+max_ram_kb = 128
+ctx = 256
+lang = ru
+
+[model.qwen3]
+kv = fp16
+ctx = 2048
+temp = 0.6
+top_p = 0.95
+
+[model.phi3]
+kv = fp16
+ctx = 2048
+temp = 0.0

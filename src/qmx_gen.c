@@ -4,6 +4,7 @@
  */
 
 #include "../include/qmx_gen.h"
+#include "../include/qmx_plugin.h"
 #include <string.h>
 
 QmxGenParams qmx_gen_params_default(void) {
@@ -32,6 +33,7 @@ int qmx_gen_is_stop_token(const QmxTokenizer *tok, int token_id) {
             strcmp(p, "<|im_end|>") == 0 ||
             strcmp(p, "<|endoftext|>") == 0 ||
             strcmp(p, "<end_of_turn>") == 0 ||
+            strcmp(p, "<|end|>") == 0 ||
             strcmp(p, "</s>") == 0) {
             return 1;
         }
@@ -240,10 +242,14 @@ QmxStepStatus qmx_step(QmxGenState *gen, QmxStepResult *out) {
                                      gen->bos_id, gen->eos_id, gen->eot_id);
     }
 
+    qmx_plugin_run_samplers(gen->last_logits, model->header.vocab_size,
+                            gen->recent_tokens, gen->recent_cnt);
+
     int next = qmx_sample_ex(gen->last_logits, model->header.vocab_size,
                              gen->params.temp, gen->params.top_k,
                              gen->params.top_p, gen->params.min_p,
                              &gen->rng_state);
+    qmx_plugin_emit_hook(QMX_HOOK_TOKEN_SAMPLED, 0u, 1, gen->pos, next);
     gen->last_logits = NULL;
 
     if (qmx_gen_is_stop_token(gen->tok, next)) {

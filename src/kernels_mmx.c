@@ -7,15 +7,15 @@
 
 #if defined(QMX_ENABLE_BACKEND_MMX) && (defined(__i386__) || defined(__x86_64__)) && (defined(__GNUC__) || defined(__clang__))
 
-#if !defined(__MMX__) && !defined(__DJGPP__)
+#if !defined(__MMX__) && (defined(__clang__) || (defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 9))))
     #define QMX_MMX_TARGET __attribute__((target("mmx")))
 #else
     #define QMX_MMX_TARGET
 #endif
 
 
-static const uint64_t g_mmx_q4_mask_0f   QMX_ALIGNED(8) = 0x0F0F0F0F0F0F0F0FULL;
-static const uint64_t g_mmx_q4_bias_08   QMX_ALIGNED(8) = 0x0808080808080808ULL;
+static QMX_ALIGNED(8) const uint64_t g_mmx_q4_mask_0f = 0x0F0F0F0F0F0F0F0FULL;
+static QMX_ALIGNED(8) const uint64_t g_mmx_q4_bias_08 = 0x0808080808080808ULL;
 
 
 #define QMX_EMMS() \
@@ -28,7 +28,7 @@ static void mmx_prepare_act(const float * QMX_RESTRICT x,
                             float       * QMX_RESTRICT x_scales,
                             uint32_t cols) {
     qmx_quantize_activations_q8(x, xq, x_scales, cols);
-    uint32_t pad_cols = (uint32_t)qmx_align_up(cols, QMX_TILE_COLS);
+    uint32_t pad_cols = (cols + (QMX_TILE_COLS - 1u)) & ~(QMX_TILE_COLS - 1u);
     for (uint32_t i = 0; i < pad_cols; i += 8u) {
         const int8_t *src = xq + i;
         int16_t *dst = xq16 + i;
@@ -357,6 +357,11 @@ const QmxBackendOps qmx_ops_mmx = {
     qmx_rmsnorm_quant_scalar,
     qmx_swiglu_quant_scalar,
     qmx_f16_to_f32_scalar,
-    qmx_f32_to_f16_scalar
+    qmx_f32_to_f16_scalar,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 #endif

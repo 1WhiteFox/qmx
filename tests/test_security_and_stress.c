@@ -107,6 +107,25 @@ static void test_malformed_cartridges(const char *valid_qmx) {
     EXPECT_TRUE(qmx_load(&m, tmp_path, 0, QMX_BACKEND_SCALAR, 0, 0, 0) != 0,
                 "Reject tensor rows exceeding destination arena slot capacity");
 
+    /* 5. Выход 64-битного tokenizer_offset_hi за пределы файла */
+    memcpy(mut, orig, len);
+    h = (QmxHeader *)mut;
+    h->tokenizer_offset_hi = 1u;
+    rehash_header_crc(mut);
+    f = fopen(tmp_path, "wb"); fwrite(mut, 1, len, f); fclose(f);
+    EXPECT_TRUE(qmx_load(&m, tmp_path, 0, QMX_BACKEND_SCALAR, 0, 0, 0) != 0,
+                "Reject out-of-bounds 64-bit tokenizer_offset_hi");
+
+    /* 6. Невыровненный scales_offset (защита от HardFault/UB на ARM/MCU) */
+    memcpy(mut, orig, len);
+    h = (QmxHeader *)mut;
+    descs = (QmxTensorDesc *)(mut + h->tensor_dir_offset);
+    descs[0].scales_offset += 2u;
+    rehash_header_crc(mut);
+    f = fopen(tmp_path, "wb"); fwrite(mut, 1, len, f); fclose(f);
+    EXPECT_TRUE(qmx_load(&m, tmp_path, 0, QMX_BACKEND_SCALAR, 0, 0, 0) != 0,
+                "Reject misaligned scales_offset (< 4-byte alignment)");
+
     remove(tmp_path);
     free(mut);
     free(orig);
@@ -399,7 +418,7 @@ static void test_v11_header_and_xip_tok_align(const char *valid_qmx) {
     QmxBpeMergeEntry merge0 = { 3u, 4u, 5u, 0u };
     QmxTokenizerHeader th = { QMX_TOKENIZER_MAGIC, vocab_size, 1u, 5u, 1, 2, -1, 0u };
 
-    uint8_t xip_tok_buf[256] QMX_ALIGNED(16);
+    QMX_ALIGNED(16) uint8_t xip_tok_buf[256];
     size_t pos = 0;
     memcpy(xip_tok_buf + pos, &th, sizeof(th)); pos += sizeof(th);
     memcpy(xip_tok_buf + pos, offsets, sizeof(offsets)); pos += sizeof(offsets);
@@ -417,12 +436,75 @@ static void test_v11_header_and_xip_tok_align(const char *valid_qmx) {
     qmx_tokenizer_free(&xtok);
 }
 
+typedef struct {
+    const uint8_t *buf;
+    size_t         len;
+} TestCrcMemCtx;
+
+static int test_crc_mem_read(void *ctx, uint64_t offset, void *dst, size_t size) {
+    TestCrcMemCtx *m = (TestCrcMemCtx *)ctx;
+    if (!m || !m->buf || offset > (uint64_t)m->len || size > m->len - (size_t)offset) return -1;
+    if (size > 0u) memcpy(dst, m->buf + (size_t)offset, size);
+    return 0;
+}
+
+static void test_file_crc32_verification(const char *valid_qmx) {
+    const char *tmp_path = "test_crc_tmp.qmx";
+    uint8_t *orig = NULL;
+    size_t len = 0;
+    if (copy_file_bytes(valid_qmx, NULL, &orig, &len) != 0) {
+        fprintf(stderr, "[FAIL] Cannot read %s for file_crc32 test\n", valid_qmx);
+        g_failures++;
+        return;
+    }
+
+    uint32_t stored = 0u, calc = 0u;
+    EXPECT_TRUE(qmx_verify_crc_file(valid_qmx, 0u, 0u, &stored, &calc) == 0 && stored != 0u && stored == calc,
+                "Freshly packed cartridge passes qmx_verify_crc_file");
+    EXPECT_TRUE(qmx_verify_crc_memory(orig, len, &stored, &calc) == 0 && stored == calc,
+                "Freshly packed cartridge passes qmx_verify_crc_memory");
+
+    TestCrcMemCtx mctx = { orig, len };
+    QmxReader rd = { test_crc_mem_read, NULL, &mctx, (uint64_t)len };
+    EXPECT_TRUE(qmx_verify_crc_reader(&rd, &stored, &calc) == 0 && stored == calc,
+                "Freshly packed cartridge passes qmx_verify_crc_reader");
+
+    uint8_t *mut = (uint8_t *)malloc(len);
+    memcpy(mut, orig, len);
+    mut[len - 17u] ^= 0x01u;
+    EXPECT_TRUE(qmx_verify_crc_memory(mut, len, &stored, &calc) < 0 && stored != calc,
+                "Reject 1-bit payload corruption via qmx_verify_crc_memory");
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (f) { fwrite(mut, 1, len, f); fclose(f); }
+    EXPECT_TRUE(qmx_verify_crc_file(tmp_path, 0u, 0u, &stored, &calc) < 0 && stored != calc,
+                "Reject 1-bit payload corruption via qmx_verify_crc_file");
+
+    EXPECT_TRUE(qmx_verify_crc_memory(orig, len - 64u, NULL, NULL) < 0,
+                "Reject truncated cartridge via qmx_verify_crc_memory");
+
+    memcpy(mut, orig, len);
+    ((QmxHeader *)mut)->file_crc32 = 0u;
+    rehash_header_crc(mut);
+    EXPECT_TRUE(qmx_verify_crc_memory(mut, len, &stored, &calc) == 1 && stored == 0u,
+                "Legacy cartridge with file_crc32==0 returns 1 (graceful skip)");
+
+    ((QmxHeader *)mut)->header_crc32 ^= 0x12345678u;
+    EXPECT_TRUE(qmx_verify_crc_memory(mut, len, NULL, NULL) < 0,
+                "Corrupted header_crc32 rejected by qmx_verify_crc_memory");
+
+    remove(tmp_path);
+    free(mut);
+    free(orig);
+}
+
 int main(int argc, char **argv) {
     const char *qmx_path = (argc > 1) ? argv[1] : "test_q4.qmx";
     test_malformed_cartridges(qmx_path);
     test_contractions_and_long_bpe();
     test_sequential_stream_reads(qmx_path);
     test_v11_header_and_xip_tok_align(qmx_path);
+    test_file_crc32_verification(qmx_path);
 
     if (g_failures == 0) {
         printf("[PASS] All security, BPE contraction, XIP & sequential streaming stress tests passed!\n");

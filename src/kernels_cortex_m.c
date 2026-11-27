@@ -47,7 +47,9 @@ static int32_t cm0_dot_row32(const uint8_t * QMX_RESTRICT rp,
                              const int8_t  * QMX_RESTRICT xp,
                              uint8_t qtype) {
     int32_t acc = 0;
-    if (qtype == QMX_QUANT_Q8_SYM) {
+    if (0) { (void)0; }
+#if QMX_HAS_QUANT(QMX_QID_Q8_SYM)
+    else if (qtype == QMX_QUANT_Q8_SYM) {
         const int8_t *wp = (const int8_t *)rp;
         for (uint32_t i = 0; i < 32u; i += 4u) {
             acc += (int32_t)wp[i + 0u] * (int32_t)xp[i + 0u]
@@ -55,7 +57,10 @@ static int32_t cm0_dot_row32(const uint8_t * QMX_RESTRICT rp,
                  + (int32_t)wp[i + 2u] * (int32_t)xp[i + 2u]
                  + (int32_t)wp[i + 3u] * (int32_t)xp[i + 3u];
         }
-    } else if (qtype == QMX_QUANT_Q4_SYM) {
+    }
+#endif
+#if QMX_HAS_QUANT(QMX_QID_Q4_SYM)
+    else if (qtype == QMX_QUANT_Q4_SYM) {
         for (uint32_t b = 0; b < 16u; b += 2u) {
             uint32_t p0 = rp[b + 0u];
             uint32_t p1 = rp[b + 1u];
@@ -64,14 +69,19 @@ static int32_t cm0_dot_row32(const uint8_t * QMX_RESTRICT rp,
                  + ((int32_t)(p1 & 0x0Fu) - 8) * (int32_t)xp[b * 2u + 2u]
                  + ((int32_t)(p1 >> 4u)   - 8) * (int32_t)xp[b * 2u + 3u];
         }
-    } else if (qtype == QMX_QUANT_TERNARY_158) {
+    }
+#endif
+#if QMX_HAS_QUANT(QMX_QID_TERNARY_158)
+    else if (qtype == QMX_QUANT_TERNARY_158) {
         for (uint32_t b = 0; b < 8u; b++) {
             const int8_t *l = qmx_lut_ternary_s8[rp[b]];
             const int8_t *x = xp + b * 4u;
             acc += (int32_t)l[0] * x[0] + (int32_t)l[1] * x[1]
                  + (int32_t)l[2] * x[2] + (int32_t)l[3] * x[3];
         }
-    } else {
+    }
+#endif
+    else {
         for (uint32_t b = 0; b < 4u; b++) {
             uint8_t p = rp[b];
             const int8_t *l0 = qmx_lut_binary_s8[p & 0x0Fu];
@@ -172,7 +182,9 @@ static void cm3_dot_2rows_32(const uint8_t * QMX_RESTRICT r0,
                              int32_t * QMX_RESTRICT out0,
                              int32_t * QMX_RESTRICT out1) {
     int32_t a0 = 0, a1 = 0;
-    if (qtype == QMX_QUANT_Q8_SYM) {
+    if (0) { (void)0; }
+#if QMX_HAS_QUANT(QMX_QID_Q8_SYM)
+    else if (qtype == QMX_QUANT_Q8_SYM) {
         const int8_t *w0 = (const int8_t *)r0;
         const int8_t *w1 = (const int8_t *)r1;
         for (uint32_t i = 0; i < 32u; i += 4u) {
@@ -182,7 +194,10 @@ static void cm3_dot_2rows_32(const uint8_t * QMX_RESTRICT r0,
             a1 = cm3_mla(a1, w1[i + 0u], x0); a1 = cm3_mla(a1, w1[i + 1u], x1);
             a1 = cm3_mla(a1, w1[i + 2u], x2); a1 = cm3_mla(a1, w1[i + 3u], x3);
         }
-    } else if (qtype == QMX_QUANT_Q4_SYM) {
+    }
+#endif
+#if QMX_HAS_QUANT(QMX_QID_Q4_SYM)
+    else if (qtype == QMX_QUANT_Q4_SYM) {
         for (uint32_t b = 0; b < 16u; b += 4u) {
             uint32_t w0_32 = 0, w1_32 = 0;
             memcpy(&w0_32, r0 + b, 4);
@@ -206,7 +221,10 @@ static void cm3_dot_2rows_32(const uint8_t * QMX_RESTRICT r0,
             a1 = cm3_mla(a1, (int32_t)cm3_ubfx4(w1_32, 24) - 8, x[6]);
             a1 = cm3_mla(a1, (int32_t)cm3_ubfx4(w1_32, 28) - 8, x[7]);
         }
-    } else if (qtype == QMX_QUANT_TERNARY_158) {
+    }
+#endif
+#if QMX_HAS_QUANT(QMX_QID_TERNARY_158)
+    else if (qtype == QMX_QUANT_TERNARY_158) {
         for (uint32_t b = 0; b < 8u; b++) {
             const int8_t *l0 = qmx_lut_ternary_s8[r0[b]];
             const int8_t *l1 = qmx_lut_ternary_s8[r1[b]];
@@ -216,7 +234,9 @@ static void cm3_dot_2rows_32(const uint8_t * QMX_RESTRICT r0,
             a1 = cm3_mla(a1, l1[0], x[0]); a1 = cm3_mla(a1, l1[1], x[1]);
             a1 = cm3_mla(a1, l1[2], x[2]); a1 = cm3_mla(a1, l1[3], x[3]);
         }
-    } else {
+    }
+#endif
+    else {
         for (uint32_t b = 0; b < 4u; b++) {
             uint8_t p0 = r0[b], p1 = r1[b];
             const int8_t *l0a = qmx_lut_binary_s8[p0 & 0x0Fu], *l0b = qmx_lut_binary_s8[p0 >> 4u];
@@ -322,7 +342,9 @@ static int32_t cm4_dot_row32(const uint8_t  * QMX_RESTRICT rp,
                              const uint32_t * QMX_RESTRICT xp_pairs,
                              uint8_t qtype) {
     int32_t acc = 0;
-    if (qtype == QMX_QUANT_Q8_SYM) {
+    if (0) { (void)0; }
+#if QMX_HAS_QUANT(QMX_QID_Q8_SYM)
+    else if (qtype == QMX_QUANT_Q8_SYM) {
         for (uint32_t i = 0; i < 8u; i++) {
             uint32_t w4 = 0;
             memcpy(&w4, rp + i * 4u, 4);
@@ -334,20 +356,28 @@ static int32_t cm4_dot_row32(const uint8_t  * QMX_RESTRICT rp,
             acc = cm4_smlad(acc, p01, xp_pairs[i * 2u + 0u]);
             acc = cm4_smlad(acc, p23, xp_pairs[i * 2u + 1u]);
         }
-    } else if (qtype == QMX_QUANT_Q4_SYM) {
+    }
+#endif
+#if QMX_HAS_QUANT(QMX_QID_Q4_SYM)
+    else if (qtype == QMX_QUANT_Q4_SYM) {
         for (uint32_t b = 0; b < 16u; b++) {
             uint8_t p = rp[b];
             int16_t w0 = (int16_t)((int32_t)(p & 0x0Fu) - 8);
             int16_t w1 = (int16_t)((int32_t)(p >> 4u)   - 8);
             acc = cm4_smlad(acc, cm_pack_i16_pair(w0, w1), xp_pairs[b]);
         }
-    } else if (qtype == QMX_QUANT_TERNARY_158) {
+    }
+#endif
+#if QMX_HAS_QUANT(QMX_QID_TERNARY_158)
+    else if (qtype == QMX_QUANT_TERNARY_158) {
         for (uint32_t b = 0; b < 8u; b++) {
             const uint32_t *lut = qmx_lut_ternary_u32[rp[b]];
             acc = cm4_smlad(acc, lut[0], xp_pairs[b * 2u + 0u]);
             acc = cm4_smlad(acc, lut[1], xp_pairs[b * 2u + 1u]);
         }
-    } else {
+    }
+#endif
+    else {
         for (uint32_t b = 0; b < 4u; b++) {
             uint8_t p = rp[b];
             const uint32_t *l0 = qmx_lut_binary_u32[p & 0x0Fu];
@@ -494,10 +524,15 @@ static void cm55_matmul_tiled(float         * QMX_RESTRICT out,
                 if (r_base + lr >= orig_rows) break;
                 int32_t dot = 0;
                 const uint8_t *rp = tile_ptr + (size_t)lr * row_bytes;
-                if (base_qtype == QMX_QUANT_Q8_SYM) {
+                if (0) { (void)0; }
+#if QMX_HAS_QUANT(QMX_QID_Q8_SYM)
+                else if (base_qtype == QMX_QUANT_Q8_SYM) {
                     dot = vmladavq_s8(vldrbq_s8((const int8_t *)rp), x0);
                     dot = vmladavaq_s8(dot, vldrbq_s8((const int8_t *)rp + 16u), x1);
-                } else if (base_qtype == QMX_QUANT_Q4_SYM) {
+                }
+#endif
+#if QMX_HAS_QUANT(QMX_QID_Q4_SYM)
+                else if (base_qtype == QMX_QUANT_Q4_SYM) {
                     int8_t wtmp[32];
                     for (uint32_t b = 0; b < 16u; b++) {
                         uint8_t p = rp[b];
@@ -506,7 +541,9 @@ static void cm55_matmul_tiled(float         * QMX_RESTRICT out,
                     }
                     dot = vmladavq_s8(vldrbq_s8(wtmp), x0);
                     dot = vmladavaq_s8(dot, vldrbq_s8(wtmp + 16u), x1);
-                } else {
+                }
+#endif
+                else {
                     dot = cm0_dot_row32(rp, xp, base_qtype);
                 }
                 float comb_scale = is_row_scaled ? (qmx_fp16_to_fp32(row_sc[lr]) * x_sc) : tile_comb_scale;
@@ -546,27 +583,27 @@ static void cm_saxpy_f32(float * QMX_RESTRICT y, float a, const float * QMX_REST
 }
 
 const QmxBackendOps qmx_ops_cortex_m0 = {
-    "Cortex-M0/M0+", cm_prepare_act_q8, cm0_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar
+    "Cortex-M0/M0+", cm_prepare_act_q8, cm0_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar, NULL, NULL, NULL, NULL, NULL
 };
 
 const QmxBackendOps qmx_ops_cortex_m23 = {
-    "Cortex-M23", cm_prepare_act_q8, cm0_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar
+    "Cortex-M23", cm_prepare_act_q8, cm0_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar, NULL, NULL, NULL, NULL, NULL
 };
 
 const QmxBackendOps qmx_ops_cortex_m3 = {
-    "Cortex-M3", cm_prepare_act_q8, cm3_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar
+    "Cortex-M3", cm_prepare_act_q8, cm3_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar, NULL, NULL, NULL, NULL, NULL
 };
 
 const QmxBackendOps qmx_ops_cortex_m4 = {
-    "Cortex-M4/M7", cm_prepare_act_q8_q16, cm4_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm4_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar
+    "Cortex-M4/M7", cm_prepare_act_q8_q16, cm4_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm4_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar, NULL, NULL, NULL, NULL, NULL
 };
 
 const QmxBackendOps qmx_ops_cortex_m33 = {
-    "Cortex-M33", cm_prepare_act_q8_q16, cm4_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm4_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar
+    "Cortex-M33", cm_prepare_act_q8_q16, cm4_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm4_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar, NULL, NULL, NULL, NULL, NULL
 };
 
 const QmxBackendOps qmx_ops_cortex_m55 = {
-    "Cortex-M55", cm_prepare_act_q8, cm55_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar
+    "Cortex-M55", cm_prepare_act_q8, cm55_matmul_tiled, qmx_rmsnorm_scalar, cm_dot_f32, cm_saxpy_f32, cm55_dot_q8, qmx_rmsnorm_quant_scalar, qmx_swiglu_quant_scalar, qmx_f16_to_f32_scalar, qmx_f32_to_f16_scalar, NULL, NULL, NULL, NULL, NULL
 };
 
 #endif

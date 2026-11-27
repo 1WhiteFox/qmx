@@ -1,0 +1,142 @@
+name: QMX Runtime CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-host:
+    name: Linux (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [ gcc, clang ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain & Python deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib clang python3-numpy
+
+      - name: Build & run unit, integration, packer and sanitizer suites
+        run: |
+          make CC=${{ matrix.cc }} test
+          make CC=${{ matrix.cc }} test-san
+          make CC=${{ matrix.cc }} test-mcu-nomalloc
+          make CC=${{ matrix.cc }} test-amalgamate
+          ${{ matrix.cc }} -std=c99 -Wall -Wextra -Idist -fno-builtin -DQMX_DISABLE_AVX512 -O3 -c dist/qmx.c -o build/amalg/qmx_noavx512.o
+
+      - name: Run x86 ISA gatekeeper & 19-backend parity (offline)
+        run: |
+          python3 tools/test_all_isa.py --model test_q4.qmx --skip-build
+
+      - name: Run 60s libFuzzer (Clang)
+        if: matrix.cc == 'clang'
+        run: |
+          make fuzz FUZZ_TIME=60
+
+  retro-and-mcu:
+    name: Retro (i586/Win98/Win64) & ARM Cortex-M
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib mingw-w64 gcc-arm-none-eabi python3-numpy
+
+      - name: Build & verify Socket 7 Linux ELF, Win98 (0 CMOV) and Win64
+        run: |
+          make x86-p54c x86-mmx k6-3dnow win98 win64
+
+      - name: Verify ARM Cortex-M0..M55 machine code & bare-metal amalgamation
+        run: |
+          make amalgamate
+          python3 -c "import sys; sys.path.insert(0, 'tools'); import test_all_isa; test_all_isa.verify_arm_cortex_m_cross()"
+          arm-none-eabi-gcc -std=c99 -Wall -Wextra -Idist -fno-builtin -mcpu=cortex-m4 -mthumb -DQMX_NO_STDIO -DQMX_NO_MALLOC -DQMX_NO_THREADS -DQMX_NO_MMAP -DQMX_NO_SIMD -DQMX_NO_CUSTOM_BACKENDS -DQMX_NO_PLUGINS -O2 -c dist/qmx.c -o build/qmx_cm4.o
+          ! arm-none-eabi-nm -u build/qmx_cm4.o | grep -E '\b(malloc|calloc|realloc|free|fopen|fread|fseek|ftell|printf|fprintf)\b'
+
+  arm64-qemu:
+    name: ARM64 NEON-DotProd (QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install AArch64 cross-compiler & QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static python3-numpy
+
+      - name: Build ARM64 NEON + DotProd & run tests under QEMU
+        run: |
+          mkdir -p build/arm64
+          python3 tools/qmx_pack.py --dummy -q q4 -o test_q4.qmx
+          make amalgamate
+          aarch64-linux-gnu-gcc -std=c99 -Wall -Wextra -Iinclude -fno-builtin -O3 -c src/kernels_neon.c -o build/arm64/kernels_neon.o
+          aarch64-linux-gnu-objdump -d build/arm64/kernels_neon.o | grep -qE '\bsdot\b'
+          aarch64-linux-gnu-gcc -std=c99 -Wall -Wextra -Idist -fno-builtin -DQMX_ENABLE_THREADS -pthread -O2 -c dist/qmx.c -o build/arm64/qmx_arm64.o
+          for t in test_ops test_vm test_simd test_xip_15k; do
+            aarch64-linux-gnu-gcc -std=c99 -Wall -Wextra -Iinclude -fno-builtin -DQMX_ENABLE_THREADS -pthread -O2 -static tests/$t.c build/arm64/qmx_arm64.o -lm -o build/arm64/$t
+          done
+          qemu-aarch64-static build/arm64/test_ops
+          qemu-aarch64-static build/arm64/test_vm test_q4.qmx
+          qemu-aarch64-static build/arm64/test_simd test_q4.qmx
+          qemu-aarch64-static build/arm64/test_xip_15k
+
+  windows-msvc:
+    name: Windows x64 (MSVC /arch:SSE2 multi-ISA)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install NumPy & generate test cartridge
+        shell: cmd
+        run: |
+          python -m pip install --upgrade numpy
+          python tools\qmx_pack.py --dummy -q q4 -o test_q4.qmx
+          python tools\amalgamate.py dist
+          python tests\test_packer.py
+
+      - name: Setup MSVC x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build & test with MSVC (baseline /arch:SSE2, SSE..AVX-512 runtime dispatch)
+        shell: cmd
+        run: |
+          mkdir build\msvc
+          cl /nologo /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Idist /DQMX_ENABLE_THREADS /DQMX_ENABLE_DYNAMIC_PLUGINS /c dist\qmx.c /Fobuild\msvc\qmx.obj
+          cl /nologo /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Iinclude /DQMX_ENABLE_THREADS /DQMX_ENABLE_DYNAMIC_PLUGINS apps\common\qmx_app_common.c apps\common\qmx_profiles.c apps\common\qmx_session.c apps\qmx-cli\main.c build\msvc\qmx.obj /Febuild\msvc\qmx.exe
+          cl /nologo /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Iinclude /DQMX_ENABLE_THREADS /DQMX_ENABLE_DYNAMIC_PLUGINS apps\common\qmx_app_common.c apps\common\qmx_profiles.c apps\common\qmx_session.c apps\qmx-ppl\main.c build\msvc\qmx.obj /Febuild\msvc\qmx-ppl.exe
+          build\msvc\qmx.exe -m test_q4.qmx -p "Hello" -n 16 -b auto --verify-crc
+          build\msvc\qmx-ppl.exe -m test_q4.qmx -p "Hello world, QMX MSVC FlashAttention test!" -c 32 --kv16 --verify-crc -q
+          for %%t in (test_ops test_vm test_simd test_tokenizer test_security_and_stress test_reader test_gen test_xip_15k) do (
+            cl /nologo /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Iinclude /DQMX_ENABLE_THREADS tests\%%t.c build\msvc\qmx.obj /Febuild\msvc\%%t.exe || exit /b 1
+          )
+          build\msvc\test_ops.exe
+          build\msvc\test_vm.exe test_q4.qmx
+          build\msvc\test_simd.exe test_q4.qmx
+          build\msvc\test_tokenizer.exe test_q4.qmx
+          build\msvc\test_security_and_stress.exe test_q4.qmx
+          build\msvc\test_reader.exe test_q4.qmx
+          build\msvc\test_gen.exe test_q4.qmx
+          build\msvc\test_xip_15k.exe
+          cl /nologo /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Iinclude /DQMX_ENABLE_THREADS tests\test_profiles.c apps\common\qmx_app_common.c apps\common\qmx_profiles.c apps\common\qmx_session.c build\msvc\qmx.obj /Febuild\msvc\test_profiles.exe
+          build\msvc\test_profiles.exe
+          cl /nologo /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Iinclude /DQMX_ENABLE_THREADS tests\test_session.c apps\common\qmx_app_common.c apps\common\qmx_profiles.c apps\common\qmx_session.c build\msvc\qmx.obj /Febuild\msvc\test_session.exe
+          build\msvc\test_session.exe

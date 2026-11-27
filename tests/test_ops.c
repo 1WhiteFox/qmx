@@ -27,6 +27,13 @@ static void test_crc32(void) {
         fprintf(stderr, "[FAIL] crc32: got=0x%08X expected=0xCBF43926\n", crc);
         g_failures++;
     }
+    uint32_t sc = 0xFFFFFFFFu;
+    sc = qmx_crc32_update(sc, vec, 4);
+    sc = qmx_crc32_update(sc, vec + 4, 5);
+    if (~sc != 0xCBF43926u) {
+        fprintf(stderr, "[FAIL] crc32_update: got=0x%08X expected=0xCBF43926\n", ~sc);
+        g_failures++;
+    }
 }
 
 static void test_rmsnorm_and_softmax(void) {

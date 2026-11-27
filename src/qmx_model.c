@@ -64,6 +64,7 @@ typedef struct {
     uint64_t  all_scales_bytes64;
     uint32_t  max_matrix_tiles;
     int       need_xq16;
+    int       need_xq_eo;
     size_t    base_arena_bytes;
     uint32_t  stream_tile_cap;
     uint32_t  emb_cache_cap;
@@ -87,8 +88,29 @@ static int qmx_plan_needs_xq16(QmxBackend requested, size_t max_ram_bytes, int i
 #endif
 }
 
+static int qmx_plan_needs_xq_eo(QmxBackend requested, size_t max_ram_bytes, int is_external_arena) {
+#if defined(QMX_NO_SIMD) || (!defined(QMX_ENABLE_BACKEND_AVX2) && !defined(QMX_ENABLE_BACKEND_X86_EXT))
+    (void)requested;
+    (void)max_ram_bytes;
+    (void)is_external_arena;
+    return 0;
+#else
+    if (is_external_arena || (max_ram_bytes > 0u && max_ram_bytes <= 262144u)) {
+        QmxBackend b = (requested == QMX_BACKEND_AUTO) ? qmx_detect_backend() : requested;
+        return qmx_backend_needs_xq_eo(b);
+    }
+    return 1;
+#endif
+}
+
 static int qmx_range_valid64(uint64_t off, uint64_t len, uint64_t limit) {
     return (off <= limit) && (len <= limit - off);
+}
+
+static int qmx_add_aligned_u64(uint64_t *acc, uint64_t bytes, uint64_t align) {
+    uint64_t aligned = 0u;
+    if (qmx_align_up64_checked(bytes, align, &aligned) != 0) return -1;
+    return qmx_checked_add_u64(*acc, aligned, acc);
 }
 
 static int qmx_src_read(const QmxSource *src, uint64_t rel_off, void *dst, size_t len) {
@@ -404,6 +426,85 @@ static int validate_and_bind_recipe(QmxModel *model, uint32_t max_tensor_cols) {
                 pc++;
             }
         }
+
+        for (uint32_t pc = 0; pc + 3u < h->recipe_count; pc++) {
+            const QmxInstruction *a = &model->recipe[pc];
+            const QmxInstruction *b = &model->recipe[pc + 1u];
+            const QmxInstruction *c = &model->recipe[pc + 2u];
+            const QmxInstruction *d = &model->recipe[pc + 3u];
+            if (a->op != QMX_OP_MATMUL || b->op != QMX_OP_MATMUL ||
+                c->op != QMX_OP_SWIGLU || d->op != QMX_OP_QUANT_ACT) {
+                continue;
+            }
+            if (a->src_buf != b->src_buf || a->dst_buf == b->dst_buf ||
+                a->dst_buf != c->src_buf || b->dst_buf != c->dst_buf ||
+                c->dst_buf != d->src_buf || model->recipe_quant_cols[pc + 3u] != inter_dim) {
+                continue;
+            }
+            if (!qmx_slot_dead_after_quant(model->recipe, h->recipe_count, pc + 4u, a->dst_buf) ||
+                !qmx_slot_dead_after_quant(model->recipe, h->recipe_count, pc + 4u, b->dst_buf)) {
+                continue;
+            }
+            int ok = 1;
+            for (uint32_t l = 0; l < h->num_layers; l++) {
+                const QmxTensor *wg = model->recipe_tensors[(size_t)l * h->recipe_count + pc];
+                const QmxTensor *wu = model->recipe_tensors[(size_t)l * h->recipe_count + pc + 1u];
+                if (!wg || !wu || wg->rows != inter_dim || wu->rows != inter_dim || wg->cols != wu->cols) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok) {
+                model->recipe_fuse[pc] = QMX_FUSE_FFN_GATE_UP_SWIGLU;
+            }
+        }
+    }
+
+    model->qkv_fuse_valid = 0u;
+    for (uint32_t pc = 0; pc + 2u < h->recipe_count; pc++) {
+        const QmxInstruction *m0 = &model->recipe[pc];
+        if (m0->op != QMX_OP_MATMUL || m0->dst_buf == m0->src_buf) continue;
+        uint16_t sbuf = m0->src_buf;
+        uint16_t d0 = m0->dst_buf;
+        uint32_t k = pc + 1u;
+        while (k < h->recipe_count &&
+               (model->recipe[k].op == QMX_OP_ADD_BIAS || model->recipe[k].op == QMX_OP_QK_NORM) &&
+               model->recipe[k].src_buf == d0 && model->recipe[k].dst_buf == d0) {
+            k++;
+        }
+        if (k >= h->recipe_count || model->recipe[k].op != QMX_OP_MATMUL ||
+            model->recipe[k].src_buf != sbuf || model->recipe[k].dst_buf == sbuf ||
+            model->recipe[k].dst_buf == d0) {
+            continue;
+        }
+        uint32_t m1_pc = k;
+        uint16_t d1 = model->recipe[k].dst_buf;
+        k++;
+        while (k < h->recipe_count &&
+               (model->recipe[k].op == QMX_OP_ADD_BIAS || model->recipe[k].op == QMX_OP_QK_NORM) &&
+               model->recipe[k].src_buf == d1 && model->recipe[k].dst_buf == d1) {
+            k++;
+        }
+        if (k >= h->recipe_count || model->recipe[k].op != QMX_OP_MATMUL ||
+            model->recipe[k].src_buf != sbuf || model->recipe[k].dst_buf == sbuf ||
+            model->recipe[k].dst_buf == d0 || model->recipe[k].dst_buf == d1) {
+            continue;
+        }
+        uint32_t m2_pc = k;
+        uint16_t d2 = model->recipe[k].dst_buf;
+        k++;
+        while (k < h->recipe_count &&
+               (model->recipe[k].op == QMX_OP_ADD_BIAS || model->recipe[k].op == QMX_OP_QK_NORM) &&
+               model->recipe[k].src_buf == d2 && model->recipe[k].dst_buf == d2) {
+            k++;
+        }
+        model->qkv_fuse_valid = 1u;
+        model->qkv_fuse_start = (uint8_t)pc;
+        model->qkv_fuse_end   = (uint8_t)(k - 1u);
+        model->qkv_fuse_pc[0] = (uint8_t)pc;
+        model->qkv_fuse_pc[1] = (uint8_t)m1_pc;
+        model->qkv_fuse_pc[2] = (uint8_t)m2_pc;
+        break;
     }
     return 0;
 }
@@ -474,7 +575,7 @@ static void init_rope_inv_freq(QmxModel *model) {
     }
 }
 
-static int qmx_plan_base(const QmxSource *src, uint32_t override_max_seq, int kv_type, int need_xq16, QmxLayoutPlan *plan) {
+static int qmx_plan_base(const QmxSource *src, uint32_t override_max_seq, int kv_type, int need_xq16, int need_xq_eo, QmxLayoutPlan *plan) {
     memset(plan, 0, sizeof(*plan));
     if (qmx_src_read(src, 0u, &plan->header, sizeof(QmxHeader)) != 0) {
         return -1;
@@ -556,8 +657,14 @@ static int qmx_plan_base(const QmxSource *src, uint32_t override_max_seq, int kv
         !qmx_range_valid64(payload_off64, payload_sz64, src->total_slice)) {
         return -1;
     }
+    if ((payload_off64 & 3u) != 0u || (src->mem != NULL && (((uintptr_t)src->mem) & 3u) != 0u)) {
+        return -1;
+    }
+    uint64_t tok_off64 = is_v11
+                       ? (((uint64_t)h->tokenizer_offset_hi << 32u) | (uint64_t)h->tokenizer_offset)
+                       : (uint64_t)h->tokenizer_offset;
     if (h->tokenizer_size > 0u &&
-        !qmx_range_valid64((uint64_t)h->tokenizer_offset, (uint64_t)h->tokenizer_size, src->total_slice)) {
+        !qmx_range_valid64(tok_off64, (uint64_t)h->tokenizer_size, src->total_slice)) {
         return -1;
     }
 
@@ -611,13 +718,15 @@ static int qmx_plan_base(const QmxSource *src, uint32_t override_max_seq, int kv
             if (d_sz64 < need_data || !qmx_range_valid64(d_off64, d_sz64, payload_sz64)) {
                 return -1;
             }
-            if (qt != QMX_QUANT_FP32) {
+            if (qt == QMX_QUANT_FP32) {
+                if ((d_off64 & 3u) != 0u) return -1;
+            } else {
                 uint64_t need_scales = qmx_matrix_scales_bytes_ex(rows, cols, qt);
-                if (!qmx_range_valid64(s_off64, need_scales, payload_sz64)) {
+                if ((s_off64 & 3u) != 0u || !qmx_range_valid64(s_off64, need_scales, payload_sz64)) {
                     return -1;
                 }
                 if (batch[k].pin_priority != QMX_PIN_CRITICAL) {
-                    all_scales_bytes64 += qmx_align_up((size_t)need_scales, QMX_CACHE_ALIGN);
+                    if (qmx_add_aligned_u64(&all_scales_bytes64, need_scales, QMX_CACHE_ALIGN) != 0) return -1;
                 }
                 uint64_t nt = ((uint64_t)qmx_align_up(rows, QMX_TILE_ROWS) / QMX_TILE_ROWS)
                             * ((uint64_t)qmx_align_up(cols, QMX_TILE_COLS) / QMX_TILE_COLS);
@@ -628,9 +737,9 @@ static int qmx_plan_base(const QmxSource *src, uint32_t override_max_seq, int kv
             if (cols > max_tensor_cols) max_tensor_cols = cols;
             if (batch[k].pin_priority == QMX_PIN_CRITICAL) {
                 if (qt != QMX_QUANT_FP32) {
-                    critical_bytes64 += (uint64_t)qmx_align_up((size_t)qmx_matrix_scales_bytes_ex(rows, cols, qt), QMX_CACHE_ALIGN);
+                    if (qmx_add_aligned_u64(&critical_bytes64, qmx_matrix_scales_bytes_ex(rows, cols, qt), QMX_CACHE_ALIGN) != 0) return -1;
                 }
-                critical_bytes64 += (uint64_t)qmx_align_up((size_t)d_sz64, QMX_CACHE_ALIGN);
+                if (qmx_add_aligned_u64(&critical_bytes64, d_sz64, QMX_CACHE_ALIGN) != 0) return -1;
             }
         }
     }
@@ -638,38 +747,75 @@ static int qmx_plan_base(const QmxSource *src, uint32_t override_max_seq, int kv
     uint32_t max_tiles_c = (uint32_t)(qmx_align_up(max_tensor_cols, QMX_TILE_COLS) / QMX_TILE_COLS);
     size_t pad_act_cols = qmx_align_up(max_tensor_cols, QMX_TILE_COLS);
 
-    size_t kv_entries       = (size_t)n_layers * seq_len * kv_dim;
-    size_t kv_scale_entries = (size_t)n_layers * seq_len * n_kv_heads;
-    size_t recipe_map_bytes = (size_t)n_layers * (size_t)h->recipe_count * sizeof(const QmxTensor *);
-    size_t quant_cols_bytes = (size_t)h->recipe_count * sizeof(uint32_t);
+    uint64_t kv_entries64       = (uint64_t)n_layers * (uint64_t)seq_len * (uint64_t)kv_dim;
+    uint64_t kv_scale_entries64 = (uint64_t)n_layers * (uint64_t)seq_len * (uint64_t)n_kv_heads;
+    uint64_t recipe_map_bytes64 = (uint64_t)n_layers * (uint64_t)h->recipe_count * (uint64_t)sizeof(const QmxTensor *);
+    uint64_t quant_cols_bytes64 = (uint64_t)h->recipe_count * (uint64_t)sizeof(uint32_t);
 
-    size_t base_arena_bytes = 0;
-    base_arena_bytes += qmx_align_up(recipe_bytes, QMX_CACHE_ALIGN);
-    base_arena_bytes += qmx_align_up((size_t)h->tensor_count * sizeof(QmxTensor), QMX_CACHE_ALIGN);
-    base_arena_bytes += qmx_align_up(recipe_map_bytes, QMX_CACHE_ALIGN);
-    base_arena_bytes += qmx_align_up(quant_cols_bytes, QMX_CACHE_ALIGN);
-    base_arena_bytes += qmx_align_up((size_t)h->recipe_count, QMX_CACHE_ALIGN);
-    base_arena_bytes += 2u * qmx_align_up((size_t)dim * sizeof(float), QMX_CACHE_ALIGN);
-    base_arena_bytes += 2u * qmx_align_up((size_t)plan->att_buf_dim * sizeof(float), QMX_CACHE_ALIGN);
-    base_arena_bytes += 2u * qmx_align_up((size_t)kv_slot_d * sizeof(float), QMX_CACHE_ALIGN);
-    base_arena_bytes += 2u * qmx_align_up((size_t)inter_dim * sizeof(float), QMX_CACHE_ALIGN);
-    base_arena_bytes += qmx_align_up(pad_act_cols * sizeof(int8_t), QMX_CACHE_ALIGN);
-    if (need_xq16) {
-        base_arena_bytes += qmx_align_up(pad_act_cols * sizeof(int16_t), QMX_CACHE_ALIGN);
+    uint64_t base_arena64 = 0u;
+    if (qmx_add_aligned_u64(&base_arena64, (uint64_t)recipe_bytes, QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)h->tensor_count * (uint64_t)sizeof(QmxTensor), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, recipe_map_bytes64, QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, quant_cols_bytes64, QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)h->recipe_count, QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)dim * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)dim * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)plan->att_buf_dim * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)plan->att_buf_dim * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)kv_slot_d * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)kv_slot_d * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)inter_dim * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)inter_dim * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)pad_act_cols * (uint64_t)sizeof(int8_t), QMX_CACHE_ALIGN) != 0 ||
+        (need_xq16 && qmx_add_aligned_u64(&base_arena64, (uint64_t)pad_act_cols * (uint64_t)sizeof(int16_t), QMX_CACHE_ALIGN) != 0) ||
+        (need_xq_eo && qmx_add_aligned_u64(&base_arena64, (uint64_t)pad_act_cols * (uint64_t)sizeof(int8_t), QMX_CACHE_ALIGN) != 0) ||
+        (need_xq_eo && qmx_add_aligned_u64(&base_arena64, (uint64_t)max_tiles_c * (uint64_t)sizeof(int32_t), QMX_CACHE_ALIGN) != 0) ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)max_tiles_c * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)half_rot * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)half_rot * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)half_rot * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)seq_len * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+        qmx_add_aligned_u64(&base_arena64, (uint64_t)vocab_size * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0) {
+        return -1;
     }
-    base_arena_bytes += qmx_align_up((size_t)max_tiles_c * sizeof(float), QMX_CACHE_ALIGN);
-    base_arena_bytes += 3u * qmx_align_up((size_t)half_rot * sizeof(float), QMX_CACHE_ALIGN);
-    base_arena_bytes += qmx_align_up((size_t)seq_len * sizeof(float), QMX_CACHE_ALIGN);
-    base_arena_bytes += qmx_align_up((size_t)vocab_size * sizeof(float), QMX_CACHE_ALIGN);
+
     if (kv_type == (int)QMX_KV_Q8) {
-        base_arena_bytes += 2u * qmx_align_up(kv_entries * sizeof(int8_t), QMX_CACHE_ALIGN);
-        base_arena_bytes += 2u * qmx_align_up(kv_scale_entries * sizeof(float), QMX_CACHE_ALIGN);
+        if (qmx_add_aligned_u64(&base_arena64, kv_entries64 * (uint64_t)sizeof(int8_t), QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&base_arena64, kv_entries64 * (uint64_t)sizeof(int8_t), QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&base_arena64, kv_scale_entries64 * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&base_arena64, kv_scale_entries64 * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0) {
+            return -1;
+        }
     } else if (kv_type == (int)QMX_KV_FP16) {
-        base_arena_bytes += 2u * qmx_align_up(kv_entries * sizeof(uint16_t), QMX_CACHE_ALIGN);
+        uint64_t kv_f16_bytes = 0u;
+        if (qmx_checked_mul_u64(kv_entries64, (uint64_t)sizeof(uint16_t), &kv_f16_bytes) != 0 ||
+            qmx_add_aligned_u64(&base_arena64, kv_f16_bytes, QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&base_arena64, kv_f16_bytes, QMX_CACHE_ALIGN) != 0) {
+            return -1;
+        }
     } else {
-        base_arena_bytes += 2u * qmx_align_up(kv_entries * sizeof(float), QMX_CACHE_ALIGN);
+        uint64_t kv_f32_bytes = 0u;
+        if (qmx_checked_mul_u64(kv_entries64, (uint64_t)sizeof(float), &kv_f32_bytes) != 0 ||
+            qmx_add_aligned_u64(&base_arena64, kv_f32_bytes, QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&base_arena64, kv_f32_bytes, QMX_CACHE_ALIGN) != 0) {
+            return -1;
+        }
     }
-    base_arena_bytes += 1024u;
+    if (qmx_checked_add_u64(base_arena64, 1024u, &base_arena64) != 0) {
+        return -1;
+    }
+
+    const uint64_t max_sz = (uint64_t)(~(size_t)0) - (uint64_t)QMX_CACHE_ALIGN;
+    if (base_arena64 > max_sz || kv_entries64 > max_sz || kv_scale_entries64 > max_sz ||
+        recipe_map_bytes64 > max_sz || quant_cols_bytes64 > max_sz) {
+        return -1;
+    }
+
+    size_t kv_entries       = (size_t)kv_entries64;
+    size_t kv_scale_entries = (size_t)kv_scale_entries64;
+    size_t recipe_map_bytes = (size_t)recipe_map_bytes64;
+    size_t quant_cols_bytes = (size_t)quant_cols_bytes64;
+    size_t base_arena_bytes = (size_t)base_arena64;
 
     plan->recipe_bytes       = recipe_bytes;
     plan->recipe_map_bytes   = recipe_map_bytes;
@@ -683,11 +829,12 @@ static int qmx_plan_base(const QmxSource *src, uint32_t override_max_seq, int kv
     plan->all_scales_bytes64 = all_scales_bytes64;
     plan->max_matrix_tiles   = max_matrix_tiles;
     plan->need_xq16          = need_xq16;
+    plan->need_xq_eo         = need_xq_eo;
     plan->base_arena_bytes   = base_arena_bytes;
     return 0;
 }
 
-static void qmx_plan_stream(QmxLayoutPlan *plan, int want_stream, size_t max_ram_bytes, int is_external) {
+static int qmx_plan_stream(QmxLayoutPlan *plan, int want_stream, size_t max_ram_bytes, int is_external) {
     uint32_t stream_tile_cap = 256u;
     int pin_all_scales_in_arena = 0;
     int use_double_buf = 0;
@@ -747,28 +894,37 @@ static void qmx_plan_stream(QmxLayoutPlan *plan, int want_stream, size_t max_ram
         emb_cache_cap = 16u;
     }
 
-    size_t stream_extra_bytes = 0u;
+    uint64_t stream_extra64 = 0u;
     if (want_stream) {
-        stream_extra_bytes += qmx_align_up((size_t)plan->critical_bytes64, QMX_CACHE_ALIGN);
-        if (pin_all_scales_in_arena) {
-            stream_extra_bytes += qmx_align_up((size_t)plan->all_scales_bytes64, QMX_CACHE_ALIGN);
+        if (qmx_add_aligned_u64(&stream_extra64, plan->critical_bytes64, QMX_CACHE_ALIGN) != 0) return -1;
+        if (pin_all_scales_in_arena &&
+            qmx_add_aligned_u64(&stream_extra64, plan->all_scales_bytes64, QMX_CACHE_ALIGN) != 0) {
+            return -1;
         }
-        stream_extra_bytes += qmx_align_up((size_t)stream_tile_cap * 32u, QMX_CACHE_ALIGN);
-        stream_extra_bytes += qmx_align_up((size_t)stream_tile_cap * 512u, QMX_CACHE_ALIGN);
-        if (use_double_buf) {
-            stream_extra_bytes += qmx_align_up((size_t)stream_tile_cap * 512u, QMX_CACHE_ALIGN);
+        if (qmx_add_aligned_u64(&stream_extra64, (uint64_t)stream_tile_cap * 32u, QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&stream_extra64, (uint64_t)stream_tile_cap * 512u, QMX_CACHE_ALIGN) != 0 ||
+            (use_double_buf && qmx_add_aligned_u64(&stream_extra64, (uint64_t)stream_tile_cap * 512u, QMX_CACHE_ALIGN) != 0) ||
+            qmx_add_aligned_u64(&stream_extra64, (uint64_t)emb_cache_cap * (uint64_t)sizeof(int32_t), QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&stream_extra64, (uint64_t)emb_cache_cap * (uint64_t)sizeof(uint32_t), QMX_CACHE_ALIGN) != 0 ||
+            qmx_add_aligned_u64(&stream_extra64, (uint64_t)emb_cache_cap * (uint64_t)plan->header.hidden_dim * (uint64_t)sizeof(float), QMX_CACHE_ALIGN) != 0 ||
+            qmx_checked_add_u64(stream_extra64, 512u, &stream_extra64) != 0) {
+            return -1;
         }
-        stream_extra_bytes += qmx_align_up((size_t)emb_cache_cap * sizeof(int32_t), QMX_CACHE_ALIGN);
-        stream_extra_bytes += qmx_align_up((size_t)emb_cache_cap * sizeof(uint32_t), QMX_CACHE_ALIGN);
-        stream_extra_bytes += qmx_align_up((size_t)emb_cache_cap * plan->header.hidden_dim * sizeof(float), QMX_CACHE_ALIGN);
-        stream_extra_bytes += 512u;
+    }
+
+    const uint64_t max_sz = (uint64_t)(~(size_t)0) - (uint64_t)QMX_CACHE_ALIGN;
+    uint64_t total_arena64 = 0u;
+    if (qmx_checked_add_u64((uint64_t)plan->base_arena_bytes, stream_extra64, &total_arena64) != 0 ||
+        total_arena64 > max_sz) {
+        return -1;
     }
 
     plan->stream_tile_cap         = stream_tile_cap;
     plan->emb_cache_cap           = emb_cache_cap;
     plan->pin_all_scales_in_arena = pin_all_scales_in_arena;
     plan->use_double_buf          = use_double_buf;
-    plan->stream_extra_bytes      = stream_extra_bytes;
+    plan->stream_extra_bytes      = (size_t)stream_extra64;
+    return 0;
 }
 
 size_t qmx_calc_arena_size(const QmxReader *reader, const QmxLoadParams *params, int is_xip) {
@@ -781,9 +937,10 @@ size_t qmx_calc_arena_size(const QmxReader *reader, const QmxLoadParams *params,
 
     QmxLayoutPlan plan;
     int kv_type = qmx_normalize_kv_type((int)p.kv_type);
-    int need_xq16 = qmx_plan_needs_xq16(p.backend, p.max_ram_bytes, 1);
-    if (qmx_plan_base(&src, p.override_max_seq, kv_type, need_xq16, &plan) != 0) return 0u;
-    qmx_plan_stream(&plan, is_xip ? 0 : 1, p.max_ram_bytes, 1);
+    int need_xq16  = qmx_plan_needs_xq16(p.backend, p.max_ram_bytes, 1);
+    int need_xq_eo = qmx_plan_needs_xq_eo(p.backend, p.max_ram_bytes, 1);
+    if (qmx_plan_base(&src, p.override_max_seq, kv_type, need_xq16, need_xq_eo, &plan) != 0) return 0u;
+    if (qmx_plan_stream(&plan, is_xip ? 0 : 1, p.max_ram_bytes, 1) != 0) return 0u;
     return plan.base_arena_bytes + plan.stream_extra_bytes + QMX_CACHE_ALIGN;
 }
 
@@ -797,9 +954,10 @@ size_t qmx_calc_arena_size_memory(const void *cartridge_mem, size_t cartridge_si
 
     QmxLayoutPlan plan;
     int kv_type = qmx_normalize_kv_type((int)p.kv_type);
-    int need_xq16 = qmx_plan_needs_xq16(p.backend, p.max_ram_bytes, 1);
-    if (qmx_plan_base(&src, p.override_max_seq, kv_type, need_xq16, &plan) != 0) return 0u;
-    qmx_plan_stream(&plan, 0, p.max_ram_bytes, 1);
+    int need_xq16  = qmx_plan_needs_xq16(p.backend, p.max_ram_bytes, 1);
+    int need_xq_eo = qmx_plan_needs_xq_eo(p.backend, p.max_ram_bytes, 1);
+    if (qmx_plan_base(&src, p.override_max_seq, kv_type, need_xq16, need_xq_eo, &plan) != 0) return 0u;
+    if (qmx_plan_stream(&plan, 0, p.max_ram_bytes, 1) != 0) return 0u;
     return plan.base_arena_bytes + QMX_CACHE_ALIGN;
 }
 
@@ -813,8 +971,9 @@ static int qmx_load_internal(QmxModel *model, QmxSource *src, const QmxLoadParam
     qmx_bind_backend_ops(model, p.backend);
 
     QmxLayoutPlan plan;
-    int need_xq16 = qmx_plan_needs_xq16(model->backend, p.max_ram_bytes, p.arena_buf != NULL);
-    if (qmx_plan_base(src, p.override_max_seq, model->kv_type, need_xq16, &plan) != 0) {
+    int need_xq16  = qmx_plan_needs_xq16(model->backend, p.max_ram_bytes, p.arena_buf != NULL);
+    int need_xq_eo = qmx_plan_needs_xq_eo(model->backend, p.max_ram_bytes, p.arena_buf != NULL);
+    if (qmx_plan_base(src, p.override_max_seq, model->kv_type, need_xq16, need_xq_eo, &plan) != 0) {
         return -1;
     }
 
@@ -897,7 +1056,7 @@ static int qmx_load_internal(QmxModel *model, QmxSource *src, const QmxLoadParam
     }
 
     model->stream_mode = want_stream;
-    qmx_plan_stream(&plan, want_stream, p.max_ram_bytes, p.arena_buf != NULL);
+    if (qmx_plan_stream(&plan, want_stream, p.max_ram_bytes, p.arena_buf != NULL) != 0) { qmx_free(model); return -1; }
 
     if (model->stream_mode) {
         model->reader = src->reader;
@@ -995,6 +1154,12 @@ static int qmx_load_internal(QmxModel *model, QmxSource *src, const QmxLoadParam
     s->xq16          = plan.need_xq16
                      ? (int16_t *)qmx_arena_alloc(&model->arena, plan.pad_act_cols * sizeof(int16_t), QMX_CACHE_ALIGN)
                      : NULL;
+    s->xq_eo         = plan.need_xq_eo
+                     ? (int8_t *)qmx_arena_alloc(&model->arena, plan.pad_act_cols * sizeof(int8_t), QMX_CACHE_ALIGN)
+                     : NULL;
+    s->x_sums        = plan.need_xq_eo
+                     ? (int32_t *)qmx_arena_alloc(&model->arena, (size_t)plan.max_tiles_c * sizeof(int32_t), QMX_CACHE_ALIGN)
+                     : NULL;
     s->x_scales      = (float *)qmx_arena_alloc(&model->arena, (size_t)plan.max_tiles_c * sizeof(float), QMX_CACHE_ALIGN);
     s->rope_inv_freq = (float *)qmx_arena_alloc(&model->arena, (size_t)half_rot * sizeof(float), QMX_CACHE_ALIGN);
     s->rope_cos      = (float *)qmx_arena_alloc(&model->arena, (size_t)half_rot * sizeof(float), QMX_CACHE_ALIGN);
@@ -1017,6 +1182,7 @@ static int qmx_load_internal(QmxModel *model, QmxSource *src, const QmxLoadParam
         s->value_cache = (float *)qmx_arena_alloc(&model->arena, plan.kv_entries * sizeof(float), QMX_CACHE_ALIGN);
         if (!s->value_cache) { qmx_free(model); return -1; }
     }
+    if (model->arena.failed) { qmx_free(model); return -1; }
 
     if (model->stream_mode) {
         s->stream_tile_cap   = plan.stream_tile_cap;
@@ -1029,7 +1195,7 @@ static int qmx_load_internal(QmxModel *model, QmxSource *src, const QmxLoadParam
         s->emb_cache_tokens  = (int32_t *)qmx_arena_alloc(&model->arena, (size_t)plan.emb_cache_cap * sizeof(int32_t), QMX_CACHE_ALIGN);
         s->emb_cache_lru     = (uint32_t *)qmx_arena_alloc(&model->arena, (size_t)plan.emb_cache_cap * sizeof(uint32_t), QMX_CACHE_ALIGN);
         s->emb_cache_vecs    = (float *)qmx_arena_alloc(&model->arena, (size_t)plan.emb_cache_cap * dim * sizeof(float), QMX_CACHE_ALIGN);
-        if (!s->emb_cache_vecs) { qmx_free(model); return -1; }
+        if (!s->emb_cache_vecs || model->arena.failed) { qmx_free(model); return -1; }
 
         for (uint32_t i = 0; i < plan.emb_cache_cap; i++) {
             s->emb_cache_tokens[i] = -1;
@@ -1103,6 +1269,106 @@ static int qmx_load_internal(QmxModel *model, QmxSource *src, const QmxLoadParam
 
     init_rope_inv_freq(model);
     return 0;
+}
+
+static int qmx_verify_crc_header_bounds(const QmxHeader *h, uint64_t total_slice, uint64_t *out_end) {
+    if (!h || total_slice < (uint64_t)sizeof(QmxHeader)) return -1;
+    if (h->magic != QMX_MAGIC ||
+        (h->version != QMX_VERSION_1_0 && h->version != QMX_VERSION_1_1)) {
+        return -1;
+    }
+    if (h->header_crc32 != 0u) {
+        QmxHeader tmp = *h;
+        tmp.header_crc32 = 0u;
+        if (qmx_crc32(&tmp, sizeof(QmxHeader)) != h->header_crc32) return -1;
+    }
+    int is_v11 = (h->version >= QMX_VERSION_1_1);
+    uint64_t rec_sz = 0u, rec_end = 0u;
+    uint64_t tdir_sz = 0u, tdir_end = 0u;
+    uint64_t tok_off = is_v11
+                     ? (((uint64_t)h->tokenizer_offset_hi << 32u) | (uint64_t)h->tokenizer_offset)
+                     : (uint64_t)h->tokenizer_offset;
+    uint64_t tok_end = 0u;
+    uint64_t pay_off = is_v11
+                     ? (((uint64_t)h->payload_offset_hi << 32u) | (uint64_t)h->payload_offset)
+                     : (uint64_t)h->payload_offset;
+    uint64_t pay_sz  = is_v11
+                     ? (((uint64_t)h->payload_size_hi << 32u) | (uint64_t)h->payload_size)
+                     : (uint64_t)h->payload_size;
+    uint64_t pay_end = 0u;
+
+    if (qmx_checked_mul_u64((uint64_t)h->recipe_count, (uint64_t)sizeof(QmxInstruction), &rec_sz) != 0 ||
+        qmx_checked_add_u64((uint64_t)h->recipe_offset, rec_sz, &rec_end) != 0 ||
+        qmx_checked_mul_u64((uint64_t)h->tensor_count, (uint64_t)sizeof(QmxTensorDesc), &tdir_sz) != 0 ||
+        qmx_checked_add_u64((uint64_t)h->tensor_dir_offset, tdir_sz, &tdir_end) != 0 ||
+        qmx_checked_add_u64(pay_off, pay_sz, &pay_end) != 0) {
+        return -1;
+    }
+    if (h->tokenizer_size > 0u) {
+        if (qmx_checked_add_u64(tok_off, (uint64_t)h->tokenizer_size, &tok_end) != 0) return -1;
+    }
+    uint64_t end = (uint64_t)sizeof(QmxHeader);
+    if (rec_end > end)  end = rec_end;
+    if (tdir_end > end) end = tdir_end;
+    if (tok_end > end)  end = tok_end;
+    if (pay_end > end)  end = pay_end;
+    if (end > total_slice) return -1;
+    *out_end = end;
+    return 0;
+}
+
+int qmx_verify_crc_reader(const QmxReader *reader, uint32_t *out_stored, uint32_t *out_calc) {
+    if (out_stored) *out_stored = 0u;
+    if (out_calc)   *out_calc   = 0u;
+    if (!reader || !reader->read || reader->size < (uint64_t)sizeof(QmxHeader)) return -1;
+
+    QmxHeader h;
+    if (reader->read(reader->ctx, 0u, &h, sizeof(QmxHeader)) != 0) return -1;
+
+    uint64_t cart_end = 0u;
+    if (qmx_verify_crc_header_bounds(&h, reader->size, &cart_end) != 0) return -1;
+
+    if (out_stored) *out_stored = h.file_crc32;
+    if (h.file_crc32 == 0u) return 1;
+
+#if defined(QMX_NO_MALLOC) || defined(__DJGPP__)
+    uint8_t buf[512];
+#else
+    uint8_t buf[4096];
+#endif
+    uint32_t crc = 0xFFFFFFFFu;
+    uint64_t pos = (uint64_t)sizeof(QmxHeader);
+    while (pos < cart_end) {
+        uint64_t rem = cart_end - pos;
+        size_t chunk = (rem > (uint64_t)sizeof(buf)) ? sizeof(buf) : (size_t)rem;
+        if (reader->read(reader->ctx, pos, buf, chunk) != 0) return -1;
+        crc = qmx_crc32_update(crc, buf, chunk);
+        pos += (uint64_t)chunk;
+    }
+    crc = ~crc;
+    if (out_calc) *out_calc = crc;
+    return (crc == h.file_crc32) ? 0 : -1;
+}
+
+int qmx_verify_crc_memory(const void *cartridge_mem, size_t cartridge_size,
+                          uint32_t *out_stored, uint32_t *out_calc) {
+    if (out_stored) *out_stored = 0u;
+    if (out_calc)   *out_calc   = 0u;
+    if (!cartridge_mem || cartridge_size < sizeof(QmxHeader)) return -1;
+
+    QmxHeader h;
+    memcpy(&h, cartridge_mem, sizeof(QmxHeader));
+
+    uint64_t cart_end = 0u;
+    if (qmx_verify_crc_header_bounds(&h, (uint64_t)cartridge_size, &cart_end) != 0) return -1;
+
+    if (out_stored) *out_stored = h.file_crc32;
+    if (h.file_crc32 == 0u) return 1;
+
+    const uint8_t *base = (const uint8_t *)cartridge_mem;
+    uint32_t crc = qmx_crc32(base + sizeof(QmxHeader), (size_t)(cart_end - (uint64_t)sizeof(QmxHeader)));
+    if (out_calc) *out_calc = crc;
+    return (crc == h.file_crc32) ? 0 : -1;
 }
 
 int qmx_load_from_reader(QmxModel *model, QmxReader reader, const QmxLoadParams *params) {
@@ -1179,6 +1445,42 @@ static void qmx_file_reader_close(void *ctx) {
 #ifndef QMX_NO_MALLOC
     free(fc);
 #endif
+}
+
+int qmx_verify_crc_file(const char *path, uint64_t base_offset, uint64_t slice_size,
+                        uint32_t *out_stored, uint32_t *out_calc) {
+    if (out_stored) *out_stored = 0u;
+    if (out_calc)   *out_calc   = 0u;
+    if (!path) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    int64_t fsz = qmx_file_size64(f);
+    if (fsz < 0 || !qmx_range_valid64(base_offset, (uint64_t)sizeof(QmxHeader), (uint64_t)fsz)) {
+        fclose(f);
+        return -1;
+    }
+
+    uint64_t total_slice = (slice_size > 0u && qmx_range_valid64(base_offset, slice_size, (uint64_t)fsz))
+                         ? slice_size
+                         : ((uint64_t)fsz - base_offset);
+
+    QmxFileReaderCtx fc;
+    memset(&fc, 0, sizeof(fc));
+    fc.fp          = f;
+    fc.base_offset = base_offset;
+    fc.size        = total_slice;
+    fc.pos_valid   = 0;
+
+    QmxReader rd;
+    rd.read  = qmx_file_reader_read;
+    rd.close = NULL;
+    rd.ctx   = &fc;
+    rd.size  = total_slice;
+
+    int rc = qmx_verify_crc_reader(&rd, out_stored, out_calc);
+    fclose(f);
+    return rc;
 }
 
 int qmx_load_ex(QmxModel *model, const char *path, uint64_t base_offset, uint64_t slice_size,
@@ -1293,8 +1595,10 @@ void qmx_get_model_info(const QmxModel *model, QmxModelInfo *out) {
     out->is_mmap          = model->is_mmap;
     out->is_xip           = model->is_xip;
     out->tensor_count     = model->header.tensor_count;
-    out->tokenizer_offset = model->header.tokenizer_offset;
-    out->tokenizer_size   = model->header.tokenizer_size;
+    out->tokenizer_offset = (model->header.version >= QMX_VERSION_1_1)
+                          ? (((uint64_t)model->header.tokenizer_offset_hi << 32u) | (uint64_t)model->header.tokenizer_offset)
+                          : (uint64_t)model->header.tokenizer_offset;
+    out->tokenizer_size   = (uint64_t)model->header.tokenizer_size;
     out->num_threads      = model->num_threads;
 }
 

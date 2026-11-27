@@ -123,7 +123,7 @@ def pack_standalone_exe(exe_path: str, qmx_path: str, cfg_bytes: bytes, out_exe:
     cfg_offset = len(exe_data)
     exe_data.extend(cfg_bytes)
 
-    trailer = struct.pack("<III4s", bundle_offset, bundle_size, cfg_offset, b"QMXP")
+    trailer = struct.pack("<QQQ4s", bundle_offset, bundle_size, cfg_offset, b"QMX2")
     exe_data.extend(trailer)
 
     out_dir = os.path.dirname(os.path.abspath(out_exe))
@@ -153,7 +153,7 @@ def prepare_retro_dist(dist_dir: str, exe_path: str, qmx_path: str, cfg_bytes: b
     with open(bat_bench, "w", encoding="ascii") as f:
         f.write("@ECHO OFF\r\n")
         f.write("CLS\r\n")
-        f.write("ECHO === QMX Runtime v1.2b Benchmark ===\r\n")
+        f.write("ECHO === QMX Runtime 1.3a-alpha Benchmark ===\r\n")
         f.write(f'{exe_name} -m {os.path.basename(qmx_path)} -p "Once upon a time" -n 128 -b auto\r\n')
         f.write("PAUSE\r\n")
 
@@ -169,6 +169,7 @@ def main():
     parser.add_argument("--info", type=str, help="Inspect metadata and verify CRC32 of a .qmx file")
     parser.add_argument("--fetch", choices=["stories260k", "stories15m"], help="Download & convert TinyStories model")
     parser.add_argument("--hf", type=str, help="Convert HuggingFace repo or local dir into .qmx")
+    parser.add_argument("--gguf", type=str, help="Convert local GGUF v2/v3 model directly into .qmx")
     parser.add_argument("--quant", "-q", choices=["binary", "ternary", "q8", "q4", "q4_r32", "q8_r32"], default="q4")
     parser.add_argument("--model", "-m", type=str, help="Input/Output .qmx model")
     parser.add_argument("--exe", "-e", type=str, help="Base binary executable")
@@ -185,6 +186,7 @@ def main():
     parser.add_argument("--max-ram-kb", type=int, default=0)
     parser.add_argument("--no-hybrid-emb", action="store_true", help="Quantize embeddings/lm_head with primary quant")
     parser.add_argument("--lm-head-quant", choices=["auto", "binary", "ternary", "q4", "q8", "q4_r32", "q8_r32"], default="auto")
+    parser.add_argument("--imatrix", type=str, help="Calibration importance matrix (.json, .dat, .npz, or .txt)")
     args = parser.parse_args()
 
     if args.info:
@@ -209,13 +211,22 @@ def main():
             qmx_path = f"{args.fetch}_{args.quant}.qmx"
         cfg, t_iter = pack.load_karpathy_bin(preset["bin_file"], preset["tok_file"])
         lm_q = None if args.lm_head_quant == "auto" else q_map[args.lm_head_quant]
-        pack.export_qmx(qmx_path, cfg, t_iter, q_map[args.quant], not args.no_hybrid_emb, lm_head_quant=lm_q)
+        imatrix_map = pack.load_imatrix(args.imatrix) if args.imatrix else None
+        pack.export_qmx(qmx_path, cfg, t_iter, q_map[args.quant], not args.no_hybrid_emb, lm_head_quant=lm_q, imatrix_map=imatrix_map)
     elif args.hf:
         if not qmx_path:
             qmx_path = "model_hf.qmx"
         cfg, t_iter = pack.load_hf_safetensors(args.hf)
         lm_q = None if args.lm_head_quant == "auto" else q_map[args.lm_head_quant]
-        pack.export_qmx(qmx_path, cfg, t_iter, q_map[args.quant], not args.no_hybrid_emb, lm_head_quant=lm_q)
+        imatrix_map = pack.load_imatrix(args.imatrix) if args.imatrix else None
+        pack.export_qmx(qmx_path, cfg, t_iter, q_map[args.quant], not args.no_hybrid_emb, lm_head_quant=lm_q, imatrix_map=imatrix_map)
+    elif args.gguf:
+        if not qmx_path:
+            qmx_path = "model_gguf.qmx"
+        cfg, t_iter = pack.load_gguf(args.gguf)
+        lm_q = None if args.lm_head_quant == "auto" else q_map[args.lm_head_quant]
+        imatrix_map = pack.load_imatrix(args.imatrix) if args.imatrix else None
+        pack.export_qmx(qmx_path, cfg, t_iter, q_map[args.quant], not args.no_hybrid_emb, lm_head_quant=lm_q, imatrix_map=imatrix_map)
 
     if not qmx_path:
         sys.exit("Error: specify --model <file.qmx>, --fetch {stories260k,stories15m}, --hf <repo>, or --info <file.qmx>")

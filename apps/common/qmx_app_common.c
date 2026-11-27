@@ -14,6 +14,7 @@
 #endif
 
 #include "qmx_app_common.h"
+#include "qmx_session.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +131,44 @@ float qmx_app_time_ms(void) {
 #endif
 }
 
+int qmx_app_parse_i32(const char *s, int min_v, int max_v, int fallback) {
+    if (!s || s[0] == '\0') return fallback;
+    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return fallback;
+    if (v < (long long)min_v) return min_v;
+    if (v > (long long)max_v) return max_v;
+    return (int)v;
+}
+
+uint32_t qmx_app_parse_u32(const char *s, uint32_t max_v, uint32_t fallback) {
+    if (!s || s[0] == '\0' || s[0] == '-') return fallback;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (end == s || *end != '\0') return fallback;
+    if (v > (unsigned long long)max_v) return max_v;
+    return (uint32_t)v;
+}
+
+uint64_t qmx_app_parse_u64(const char *s, uint64_t max_v, uint64_t fallback) {
+    if (!s || s[0] == '\0' || s[0] == '-') return fallback;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (end == s || *end != '\0') return fallback;
+    if ((uint64_t)v > max_v) return max_v;
+    return (uint64_t)v;
+}
+
+float qmx_app_parse_f32(const char *s, float min_v, float max_v, float fallback) {
+    if (!s || s[0] == '\0') return fallback;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0') return fallback;
+    if (v < (double)min_v) return min_v;
+    if (v > (double)max_v) return max_v;
+    return (float)v;
+}
+
 const char *qmx_app_quant_label(uint16_t q) {
     if (q == QMX_QUANT_BINARY_1BIT) return "1-bit";
     if (q == QMX_QUANT_TERNARY_158) return "1.58-bit";
@@ -235,28 +274,45 @@ int qmx_app_probe_self_bundle(const char *exe_path, uint64_t *out_mod_off, uint6
     if (!f) return 0;
     int64_t fsz = qmx_file_size64(f);
     if (fsz < (int64_t)(sizeof(QmxBundleTrailer) + sizeof(QmxHeader))) { fclose(f); return 0; }
-    if (qmx_fseek64(f, fsz - (int64_t)sizeof(QmxBundleTrailer), SEEK_SET) != 0) { fclose(f); return 0; }
-    QmxBundleTrailer tr;
-    if (fread(&tr, 1, sizeof(tr), f) != sizeof(tr) || memcmp(tr.magic, "QMXP", 4) != 0) {
+
+    uint64_t b_off = 0u, b_sz = 0u, c_off = 0u;
+    int found = 0;
+
+    if (fsz >= (int64_t)(sizeof(QmxBundleTrailer64) + sizeof(QmxHeader)) &&
+        qmx_fseek64(f, fsz - (int64_t)sizeof(QmxBundleTrailer64), SEEK_SET) == 0) {
+        QmxBundleTrailer64 tr64;
+        if (fread(&tr64, 1, sizeof(tr64), f) == sizeof(tr64) && memcmp(tr64.magic, "QMX2", 4) == 0) {
+            b_off = tr64.bundle_offset;
+            b_sz  = tr64.bundle_size;
+            c_off = tr64.cfg_offset;
+            found = 1;
+        }
+    }
+
+    if (!found && qmx_fseek64(f, fsz - (int64_t)sizeof(QmxBundleTrailer), SEEK_SET) == 0) {
+        QmxBundleTrailer tr;
+        if (fread(&tr, 1, sizeof(tr), f) == sizeof(tr) && memcmp(tr.magic, "QMXP", 4) == 0) {
+            b_off = (uint64_t)tr.bundle_offset;
+            b_sz  = (uint64_t)tr.bundle_size;
+            c_off = (uint64_t)tr.cfg_offset;
+            found = 1;
+        }
+    }
+
+    if (!found || b_off > (uint64_t)fsz || b_sz > (uint64_t)fsz - b_off) {
         fclose(f);
         return 0;
     }
-    if ((uint64_t)tr.bundle_offset > (uint64_t)fsz ||
-        (uint64_t)tr.bundle_size > (uint64_t)fsz - (uint64_t)tr.bundle_offset) {
-        fclose(f);
-        return 0;
-    }
-    if (out_cfg && tr.cfg_offset > 0u &&
-        (uint64_t)tr.cfg_offset <= (uint64_t)fsz - (uint64_t)sizeof(QmxRuntimeCfg)) {
-        if (qmx_fseek64(f, (int64_t)tr.cfg_offset, SEEK_SET) == 0) {
+    if (out_cfg && c_off > 0u && c_off <= (uint64_t)fsz - (uint64_t)sizeof(QmxRuntimeCfg)) {
+        if (qmx_fseek64(f, (int64_t)c_off, SEEK_SET) == 0) {
             if (fread(out_cfg, 1, sizeof(QmxRuntimeCfg), f) != sizeof(QmxRuntimeCfg)) {
                 memset(out_cfg, 0, sizeof(QmxRuntimeCfg));
             }
         }
     }
     fclose(f);
-    *out_mod_off = (uint64_t)tr.bundle_offset;
-    *out_mod_sz  = (uint64_t)tr.bundle_size;
+    *out_mod_off = b_off;
+    *out_mod_sz  = b_sz;
     return 1;
 }
 
@@ -276,6 +332,54 @@ void qmx_app_reload_tokenizer(const QmxModelInfo *info, const char *active_path,
     }
 }
 
+int qmx_app_load_uri_model_ex(const char *uri, const QmxLoadParams *lp, int verify_crc,
+                              QmxModel *model, QmxTokenizer *tok, int *has_tok) {
+    if (!uri || !lp || !model) return -1;
+    QmxReader rd;
+    if (qmx_plugin_open_reader(uri, &rd) != 0) return -1;
+    if (verify_crc) {
+        uint32_t stored_crc = 0u, calc_crc = 0u;
+        int crc_rc = qmx_verify_crc_reader(&rd, &stored_crc, &calc_crc);
+        if (crc_rc < 0) {
+            fprintf(stderr, "Error: CRC32 mismatch on %s (stored=0x%08X, calc=0x%08X)\n",
+                    uri, stored_crc, calc_crc);
+            if (rd.close) rd.close(rd.ctx);
+            return -1;
+        } else if (crc_rc == 1) {
+            fprintf(stderr, "[CRC] Warning: %s has no file_crc32 (legacy cartridge); header CRC OK.\n", uri);
+        } else {
+            fprintf(stderr, "[CRC] Verified OK: %s (file_crc32=0x%08X)\n", uri, stored_crc);
+        }
+    }
+    if (tok && has_tok) {
+        *has_tok = 0;
+        QmxHeader hdr;
+        if (rd.read && rd.size >= sizeof(QmxHeader) &&
+            rd.read(rd.ctx, 0u, &hdr, sizeof(QmxHeader)) == 0 &&
+            hdr.magic == QMX_MAGIC && hdr.tokenizer_size > 0u) {
+            uint64_t tok_off = (hdr.version >= QMX_VERSION_1_1)
+                             ? (((uint64_t)hdr.tokenizer_offset_hi << 32u) | (uint64_t)hdr.tokenizer_offset)
+                             : (uint64_t)hdr.tokenizer_offset;
+            if (qmx_tokenizer_load_reader(tok, &rd, tok_off, (uint64_t)hdr.tokenizer_size) == 0) {
+                *has_tok = 1;
+            }
+        }
+    }
+    if (qmx_load_from_reader(model, rd, lp) != 0) {
+        if (tok && has_tok && *has_tok) {
+            qmx_tokenizer_free(tok);
+            *has_tok = 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+int qmx_app_load_uri_model(const char *uri, const QmxLoadParams *lp,
+                           QmxModel *model, QmxTokenizer *tok, int *has_tok) {
+    return qmx_app_load_uri_model_ex(uri, lp, 0, model, tok, has_tok);
+}
+
 int qmx_app_run_cli(QmxModel *model, const QmxTokenizer *tok, int has_tok,
                     const char *prompt, const QmxGenParams *params, int debug_tokens) {
     if (!model || !params) return -1;
@@ -286,41 +390,25 @@ int qmx_app_run_cli(QmxModel *model, const QmxTokenizer *tok, int has_tok,
 
     const char *kv_str = (info.kv_type == QMX_KV_Q8) ? "int8"
                        : ((info.kv_type == QMX_KV_FP16) ? "fp16" : "fp32");
-    fprintf(stderr, "[QMX-Runtime] dim=%u | layers=%u | heads=%u/%u | vocab=%u | quant=0x%02x | backend=%s | kv=%s | mode=%s | arena=%.2f KB\n",
+    fprintf(stderr, "[QMX-Runtime] dim=%u | layers=%u | heads=%u/%u | vocab=%u | quant=0x%02x | backend=%s | kv=%s | mode=%s | threads=%d | arena=%.2f KB\n",
             info.hidden_dim, info.num_layers,
             info.num_heads, info.num_kv_heads,
             info.vocab_size, info.primary_quant,
             info.backend_name, kv_str,
             info.stream_mode ? "STREAM" : "RAM",
+            info.num_threads,
             (double)((float)stats.arena_used / 1024.0f));
 
     if (!prompt) prompt = "";
     char *cli_prompt_heap = NULL;
     const char *effective_prompt = prompt;
     int is_chat_wrapped = 0;
-    QmxChatTemplate cli_tpl = qmx_app_detect_chat_template(tok, has_tok);
-    if (cli_tpl != QMX_CHAT_NONE && prompt[0] != '\0' && prompt[0] != '<' && prompt[0] != '!') {
-        size_t need_cap = strlen(prompt) + 192u;
-        cli_prompt_heap = (char *)malloc(need_cap);
-        if (cli_prompt_heap) {
-            if (cli_tpl == QMX_CHAT_LLAMA3) {
-                snprintf(cli_prompt_heap, need_cap,
-                         "<|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", prompt);
-            } else if (cli_tpl == QMX_CHAT_CHATML) {
-                snprintf(cli_prompt_heap, need_cap,
-                         "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
-            } else if (cli_tpl == QMX_CHAT_PHI3) {
-                snprintf(cli_prompt_heap, need_cap,
-                         "<|user|>\n%s<|end|>\n<|assistant|>\n", prompt);
-            } else {
-                snprintf(cli_prompt_heap, need_cap,
-                         "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", prompt);
-            }
-            effective_prompt = cli_prompt_heap;
-            is_chat_wrapped = 1;
-        }
-    } else if (prompt[0] == '!') {
-        effective_prompt = prompt + 1;
+    size_t need_cap = strlen(prompt) + 192u;
+    cli_prompt_heap = (char *)malloc(need_cap);
+    if (cli_prompt_heap) {
+        (void)qmx_session_format_prompt(tok, has_tok, prompt, 1, 0,
+                                        cli_prompt_heap, need_cap, &is_chat_wrapped);
+        effective_prompt = cli_prompt_heap;
     }
 
     int max_prompt_tokens = (int)info.max_seq_len;

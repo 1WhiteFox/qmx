@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 1WhiteFox
 # SPDX-License-Identifier: Apache-2.0
+import argparse
 import os
 import platform
 import re
@@ -89,9 +90,19 @@ def verify_arm_cortex_m_cross():
 
 
 def main():
-    run_cmd(["make", "host"])
-    if not os.path.exists("stories260k_q4.qmx"):
-        run_cmd([sys.executable, "tools/qmx_forge.py", "--fetch", "stories260k", "-q", "q4", "-m", "stories260k_q4.qmx"])
+    parser = argparse.ArgumentParser(description="QMX ISA Gatekeeper & Parity Test")
+    parser.add_argument("--model", type=str, default="stories260k_q4.qmx", help="Model cartridge for parity check")
+    parser.add_argument("--skip-build", action="store_true", help="Skip running make host")
+    args = parser.parse_args()
+
+    if not args.skip_build:
+        run_cmd(["make", "host"])
+    model_path = args.model
+    if not os.path.exists(model_path):
+        if model_path == "stories260k_q4.qmx":
+            run_cmd([sys.executable, "tools/qmx_forge.py", "--fetch", "stories260k", "-q", "q4", "-m", model_path])
+        else:
+            run_cmd([sys.executable, "tools/qmx_pack.py", "--dummy", "-q", "q4", "-o", model_path])
 
     mach = platform.machine().lower()
     if mach in ("x86_64", "amd64", "i386", "i686"):
@@ -115,7 +126,7 @@ def main():
     ref_chk = None
     tested = 0
     for b in backends:
-        res = run_cmd(["./qmx", "-m", "stories260k_q4.qmx", "-p", "Once upon a time", "-n", "64", "-c", "256", "-t", "0.0", "-b", b])
+        res = run_cmd(["./qmx", "-m", model_path, "-p", "Once upon a time", "-n", "64", "-c", "256", "-t", "0.0", "-b", b])
         m = re.search(r"\(([\d.]+)\s+tok/s\)\s+\|\s+step0_checksum=([-\d.]+)", res.stderr)
         if not m:
             sys.exit(f"[FAIL] Could not parse stats for backend {b}")

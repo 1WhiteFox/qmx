@@ -75,7 +75,12 @@ const QmxBackendOps qmx_ops_scalar = {
     qmx_rmsnorm_quant_scalar,
     qmx_swiglu_quant_scalar,
     qmx_f16_to_f32_scalar,
-    qmx_f32_to_f16_scalar
+    qmx_f32_to_f16_scalar,
+    NULL,
+    NULL,
+    NULL,
+    qmx_dot_f32_f16_scalar,
+    qmx_saxpy_f32_f16_scalar
 };
 
 static const QmxBackendOps * const g_builtin_backends[QMX_BACKEND_COUNT] = {
@@ -111,7 +116,9 @@ static const QmxBackendOps * const g_builtin_backends[QMX_BACKEND_COUNT] = {
     [QMX_BACKEND_SSE41]  = &qmx_ops_sse41,
     [QMX_BACKEND_SSE42]  = &qmx_ops_sse42,
     [QMX_BACKEND_AVX]    = &qmx_ops_avx,
+#if defined(QMX_ENABLE_BACKEND_AVX512)
     [QMX_BACKEND_AVX512] = &qmx_ops_avx512,
+#endif
 #endif
 #if defined(QMX_ENABLE_BACKEND_CORTEX_M)
     [QMX_BACKEND_CORTEX_M0]  = &qmx_ops_cortex_m0,
@@ -566,6 +573,10 @@ int qmx_backend_needs_xq16(QmxBackend backend) {
         default:
             return 0;
     }
+}
+
+int qmx_backend_needs_xq_eo(QmxBackend backend) {
+    return (backend == QMX_BACKEND_AVX2 || backend == QMX_BACKEND_AVX512) ? 1 : 0;
 }
 
 void qmx_bind_backend_ops(QmxModel *model, QmxBackend requested) {

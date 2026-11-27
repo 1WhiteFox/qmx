@@ -1,3 +1,4 @@
+#ifndef QMX_NO_TOKENIZER
 /*
  * Copyright 2026 1WhiteFox
  * SPDX-License-Identifier: Apache-2.0
@@ -18,8 +19,15 @@ static int hex_nibble_val(char c) {
 }
 
 static int is_special_id(const QmxTokenizer *tok, int id) {
-    for (uint32_t i = 0; i < tok->special_count; i++) {
-        if (tok->special_ids[i] == id) return 1;
+    uint32_t n = tok->special_count;
+    if (n == 0u || id < tok->special_ids[0] || id > tok->special_ids[n - 1u]) return 0;
+    uint32_t lo = 0u, hi = n;
+    while (lo < hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1u);
+        int32_t v = tok->special_ids[mid];
+        if (v == id) return 1;
+        if (v < id) lo = mid + 1u;
+        else hi = mid;
     }
     return 0;
 }
@@ -93,7 +101,7 @@ static int can_bpe_merge_bytelevel(const char *s1, const char *s2) {
     return (c_e1 == c_f2);
 }
 
-static uint32_t tokenizer_token_merge_score(const QmxTokenizer *tok, uint32_t id) {
+static uint32_t tokenizer_left_merge_count(const QmxTokenizer *tok, uint32_t id) {
     if (!tok->merges || tok->header.merges_count == 0u) return 0u;
     uint32_t n = tok->header.merges_count;
     uint32_t lo = 0u, hi = n;
@@ -110,15 +118,18 @@ static uint32_t tokenizer_token_merge_score(const QmxTokenizer *tok, uint32_t id
             if (tok->merges[mid].left_tok <= id) lo = mid + 1u;
             else hi = mid;
         }
-        return (lo - start) + 1u;
-    }
-    for (uint32_t k = 0u; k < n; k++) {
-        if (tok->merges[k].right_tok == id) return 1u;
+        return (lo - start);
     }
     return 0u;
 }
 
-static void tokenizer_register_byte(QmxTokenizer *tok, unsigned char b, uint32_t id) {
+typedef struct {
+    uint8_t  b[256];
+    uint32_t cand[256];
+    uint32_t count;
+} QmxByteTieList;
+
+static void tokenizer_register_byte(QmxTokenizer *tok, unsigned char b, uint32_t id, QmxByteTieList *ties) {
     int32_t cur = tok->byte_to_tok[b];
     if (cur == -1) {
         tok->byte_to_tok[b] = (int32_t)id;
@@ -126,11 +137,78 @@ static void tokenizer_register_byte(QmxTokenizer *tok, unsigned char b, uint32_t
         return;
     }
     if (tok->merges && tok->header.merges_count > 0u) {
-        uint32_t sc_cur = tokenizer_token_merge_score(tok, (uint32_t)cur);
-        uint32_t sc_new = tokenizer_token_merge_score(tok, id);
+        uint32_t sc_cur = tokenizer_left_merge_count(tok, (uint32_t)cur);
+        uint32_t sc_new = tokenizer_left_merge_count(tok, id);
         if (sc_new > sc_cur) {
             tok->byte_to_tok[b] = (int32_t)id;
             if (b == ' ') tok->space_tok_id = (int32_t)id;
+        } else if (sc_cur == 0u && sc_new == 0u && ties && ties->count < 256u) {
+            ties->b[ties->count]    = b;
+            ties->cand[ties->count] = id;
+            ties->count++;
+        }
+    }
+}
+
+static void tokenizer_insert_watch(uint32_t *arr, uint32_t *cnt, uint32_t cap, uint32_t val) {
+    uint32_t n = *cnt;
+    uint32_t lo = 0u, hi = n;
+    while (lo < hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1u);
+        if (arr[mid] == val) return;
+        if (arr[mid] < val) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (n >= cap) return;
+    for (uint32_t i = n; i > lo; i--) arr[i] = arr[i - 1u];
+    arr[lo] = val;
+    *cnt = n + 1u;
+}
+
+static int tokenizer_find_watch(const uint32_t *arr, uint32_t n, uint32_t val) {
+    uint32_t lo = 0u, hi = n;
+    while (lo < hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1u);
+        if (arr[mid] == val) return (int)mid;
+        if (arr[mid] < val) lo = mid + 1u;
+        else hi = mid;
+    }
+    return -1;
+}
+
+static void tokenizer_resolve_byte_ties(QmxTokenizer *tok, const QmxByteTieList *ties) {
+    if (!ties || ties->count == 0u || !tok->merges || tok->header.merges_count == 0u) return;
+    uint32_t watch_ids[512];
+    uint8_t  watch_hit[512];
+    uint32_t watch_cnt = 0u;
+    for (uint32_t i = 0; i < ties->count; i++) {
+        int32_t cur = tok->byte_to_tok[ties->b[i]];
+        if (cur >= 0) tokenizer_insert_watch(watch_ids, &watch_cnt, 512u, (uint32_t)cur);
+        tokenizer_insert_watch(watch_ids, &watch_cnt, 512u, ties->cand[i]);
+    }
+    if (watch_cnt == 0u) return;
+    memset(watch_hit, 0, watch_cnt);
+    uint32_t min_id = watch_ids[0];
+    uint32_t max_id = watch_ids[watch_cnt - 1u];
+    uint32_t n = tok->header.merges_count;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t rt = tok->merges[k].right_tok;
+        if (rt < min_id || rt > max_id) continue;
+        int idx = tokenizer_find_watch(watch_ids, watch_cnt, rt);
+        if (idx >= 0) watch_hit[idx] = 1u;
+    }
+    for (uint32_t i = 0; i < ties->count; i++) {
+        unsigned char b = ties->b[i];
+        int32_t cur = tok->byte_to_tok[b];
+        if (cur < 0) continue;
+        if (tokenizer_left_merge_count(tok, (uint32_t)cur) > 0u) continue;
+        int idx_cur  = tokenizer_find_watch(watch_ids, watch_cnt, (uint32_t)cur);
+        int idx_cand = tokenizer_find_watch(watch_ids, watch_cnt, ties->cand[i]);
+        uint8_t h_cur  = (idx_cur >= 0) ? watch_hit[idx_cur] : 0u;
+        uint8_t h_cand = (idx_cand >= 0) ? watch_hit[idx_cand] : 0u;
+        if (h_cand > h_cur) {
+            tok->byte_to_tok[b] = (int32_t)ties->cand[i];
+            if (b == ' ') tok->space_tok_id = (int32_t)ties->cand[i];
         }
     }
 }
@@ -138,6 +216,8 @@ static void tokenizer_register_byte(QmxTokenizer *tok, unsigned char b, uint32_t
 static int tokenizer_build_indices(QmxTokenizer *tok) {
     QmxTokenizerHeader *h = &tok->header;
     uint32_t pool_sz = tok->string_pool_size;
+    QmxByteTieList ties;
+    ties.count = 0u;
     for (uint32_t i = 0; i < h->vocab_size; i++) {
         uint32_t off = tok->vocab_offsets[i];
         if (off > pool_sz || (pool_sz > 0u && off == pool_sz && tok->is_xip)) {
@@ -146,12 +226,12 @@ static int tokenizer_build_indices(QmxTokenizer *tok) {
         const char *s = tok->string_pool + off;
         size_t len = strlen(s);
         if (len == 1u) {
-            tokenizer_register_byte(tok, (unsigned char)s[0], i);
+            tokenizer_register_byte(tok, (unsigned char)s[0], i, &ties);
         } else if (len == 6u && s[0] == '<' && s[1] == '0' && (s[2] == 'x' || s[2] == 'X') && s[5] == '>') {
             int hi = hex_nibble_val(s[3]);
             int lo = hex_nibble_val(s[4]);
             if (hi >= 0 && lo >= 0) {
-                tokenizer_register_byte(tok, (unsigned char)((hi << 4) | lo), i);
+                tokenizer_register_byte(tok, (unsigned char)((hi << 4) | lo), i, &ties);
             }
         }
 
@@ -172,6 +252,7 @@ static int tokenizer_build_indices(QmxTokenizer *tok) {
             tok->special_ids[tok->special_count++] = (int32_t)i;
         }
     }
+    tokenizer_resolve_byte_ties(tok, &ties);
     return 0;
 }
 
@@ -758,3 +839,7 @@ void qmx_tokenizer_encode(const QmxTokenizer *tok, const char *text,
 #endif
     *n_tokens = count;
 }
+
+#else
+typedef int qmx_no_tokenizer_stub_t;
+#endif

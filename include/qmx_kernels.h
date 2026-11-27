@@ -18,10 +18,12 @@ extern "C" {
     #define QMX_ENABLE_BACKEND_CORTEX_M 1
 
     #if (defined(__i386__) || defined(__x86_64__)) && (defined(__GNUC__) || defined(__clang__))
-        #if !defined(QMX_DISABLE_MMX) && (defined(__MMX__) || !defined(__DJGPP__))
+        #if !defined(QMX_DISABLE_MMX) && (defined(__MMX__) || !defined(__DJGPP__) || defined(QMX_DOS_MULTI_ISA))
             #define QMX_ENABLE_BACKEND_MMX 1
         #endif
-        #if (defined(__3dNOW__) || defined(__3dnow__)) && !defined(QMX_DISABLE_3DNOW)
+        #if !defined(QMX_DISABLE_3DNOW) && (defined(__3dNOW__) || defined(__3dnow__) || \
+            (defined(__i386__) && (!defined(__DJGPP__) || defined(QMX_DOS_MULTI_ISA)) && \
+             (defined(__clang__) || (defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 9))))))
             #define QMX_ENABLE_BACKEND_3DNOW 1
         #endif
         #if !defined(__DJGPP__)
@@ -31,10 +33,11 @@ extern "C" {
         #endif
     #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
         #if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-            #define QMX_ENABLE_BACKEND_SSE2 1
-        #endif
-        #if defined(__AVX2__)
-            #define QMX_ENABLE_BACKEND_AVX2 1
+            #define QMX_ENABLE_BACKEND_SSE2    1
+            #define QMX_ENABLE_BACKEND_X86_EXT 1
+            #if !defined(QMX_DISABLE_AVX2)
+                #define QMX_ENABLE_BACKEND_AVX2 1
+            #endif
         #endif
     #endif
 
@@ -47,6 +50,12 @@ extern "C" {
 
     #if defined(__ARM_FEATURE_DSP) && (defined(__GNUC__) || defined(__clang__))
         #define QMX_ENABLE_BACKEND_ARM_DSP 1
+    #endif
+#endif
+
+#if defined(QMX_ENABLE_BACKEND_X86_EXT) && !defined(QMX_ENABLE_BACKEND_AVX512) && !defined(QMX_DISABLE_AVX512)
+    #if !defined(_MSC_VER) || _MSC_VER >= 1920
+        #define QMX_ENABLE_BACKEND_AVX512 1
     #endif
 #endif
 
@@ -98,19 +107,49 @@ struct QmxBackendOps {
     void (*f32_to_f16)(uint16_t * QMX_RESTRICT dst,
                        const float * QMX_RESTRICT src,
                        uint32_t n);
+    void (*prepare_act_eo)(const int8_t * QMX_RESTRICT xq,
+                           int8_t       * QMX_RESTRICT xq_eo,
+                           int32_t      * QMX_RESTRICT x_sums,
+                           uint32_t cols);
+    void (*matmul_tiled_eo)(float         * QMX_RESTRICT out,
+                            const int8_t  * QMX_RESTRICT xq,
+                            const int8_t  * QMX_RESTRICT xq_eo,
+                            const int32_t * QMX_RESTRICT x_sums,
+                            const float   * QMX_RESTRICT x_scales,
+                            const QmxTensor *w,
+                            int accumulate);
+    void (*matmul_tiled_batch)(float   * const *dst_batch,
+                               int8_t  * const *xq_batch,
+                               int8_t  * const *xq_eo_batch,
+                               int32_t * const *xsums_batch,
+                               float   * const *xscales_batch,
+                               int batch_size,
+                               const QmxTensor *w,
+                               int accumulate);
+    float (*dot_f32_f16)(const float    * QMX_RESTRICT a,
+                         const uint16_t * QMX_RESTRICT b,
+                         uint32_t n);
+    void (*saxpy_f32_f16)(float          * QMX_RESTRICT y,
+                          float a,
+                          const uint16_t * QMX_RESTRICT x,
+                          uint32_t n);
 };
 
-extern const int8_t   qmx_lut_ternary_s8[256][4];
-extern const int8_t   qmx_lut_binary_s8[16][4];
-extern const uint32_t qmx_lut_ternary_u32[256][2];
-extern const uint32_t qmx_lut_binary_u32[16][2];
+#if QMX_HAS_QUANT(QMX_QID_TERNARY_158) || defined(QMX_ENABLE_BACKEND_P54C) || defined(QMX_ENABLE_BACKEND_MMX) || defined(QMX_ENABLE_BACKEND_3DNOW) || defined(QMX_ENABLE_BACKEND_SSE2) || defined(QMX_ENABLE_BACKEND_AVX2) || defined(QMX_ENABLE_BACKEND_X86_EXT) || defined(QMX_ENABLE_BACKEND_NEON) || defined(QMX_ENABLE_BACKEND_ARM_DSP) || defined(QMX_ENABLE_BACKEND_MCU32)
+extern QMX_ALIGNED(32) const int8_t   qmx_lut_ternary_s8[256][4];
+extern QMX_ALIGNED(32) const uint32_t qmx_lut_ternary_u32[256][2];
+#endif
+#if QMX_HAS_QUANT(QMX_QID_BINARY_1BIT) || defined(QMX_ENABLE_BACKEND_P54C) || defined(QMX_ENABLE_BACKEND_MMX) || defined(QMX_ENABLE_BACKEND_3DNOW) || defined(QMX_ENABLE_BACKEND_SSE2) || defined(QMX_ENABLE_BACKEND_AVX2) || defined(QMX_ENABLE_BACKEND_X86_EXT) || defined(QMX_ENABLE_BACKEND_NEON) || defined(QMX_ENABLE_BACKEND_ARM_DSP) || defined(QMX_ENABLE_BACKEND_MCU32) || defined(QMX_ENABLE_BACKEND_CORTEX_M3) || defined(QMX_ENABLE_BACKEND_CORTEX_M0) || defined(QMX_ENABLE_BACKEND_CORTEX_M4)
+extern QMX_ALIGNED(32) const int8_t   qmx_lut_binary_s8[16][4];
+extern QMX_ALIGNED(32) const uint32_t qmx_lut_binary_u32[16][2];
+#endif
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
-extern const int16_t  qmx_lut_ternary_i16[256][4];
-extern const int16_t  qmx_lut_binary_i16_4[16][4];
-extern const int16_t  qmx_lut_binary_i16_8[256][8];
+extern QMX_ALIGNED(64) const int16_t  qmx_lut_ternary_i16[256][4];
+extern QMX_ALIGNED(64) const int16_t  qmx_lut_binary_i16_4[16][4];
+extern QMX_ALIGNED(64) const int16_t  qmx_lut_binary_i16_8[256][8];
 #endif
 #if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
-extern const int8_t   qmx_lut_binary_s8_8[256][8];
+extern QMX_ALIGNED(64) const int8_t   qmx_lut_binary_s8_8[256][8];
 #endif
 
 extern const QmxBackendOps qmx_ops_scalar;
@@ -154,6 +193,7 @@ int qmx_cpu_has_arm_dsp(void);
 
 QmxBackend qmx_detect_backend(void);
 int qmx_backend_needs_xq16(QmxBackend backend);
+int qmx_backend_needs_xq_eo(QmxBackend backend);
 const char *qmx_backend_name(QmxBackend backend);
 
 void qmx_register_backend(QmxBackend backend, const QmxBackendOps *ops);

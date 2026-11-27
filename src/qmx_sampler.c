@@ -196,6 +196,7 @@ int qmx_check_stop_sequence(char *tail_window, size_t window_cap,
         strstr(tail_window, "<|im_end|>") ||
         strstr(tail_window, "<|endoftext|>") ||
         strstr(tail_window, "<end_of_turn>") ||
+        strstr(tail_window, "<|end|>") ||
         strstr(tail_window, "</s>")) {
         return 1;
     }

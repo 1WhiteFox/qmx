@@ -21,8 +21,8 @@ static int g_failures = 0;
     } \
 } while (0)
 
-static uint8_t s_flash_rom[24u * 1024u] QMX_ALIGNED(64);
-static uint8_t s_mcu_sram[32u * 1024u] QMX_ALIGNED(64);
+static QMX_ALIGNED(64) uint8_t s_flash_rom[24u * 1024u];
+static QMX_ALIGNED(64) uint8_t s_mcu_sram[32u * 1024u];
 
 static size_t align64(size_t v) {
     return (v + 63u) & ~(size_t)63u;
@@ -234,7 +234,7 @@ int main(void) {
     EXPECT(info.is_xip == 1 && info.stream_mode == 0 && stats.disk_reads == 0u, "Pure Zero-Copy XIP active");
 
     QmxTokenizer tok;
-    EXPECT(qmx_tokenizer_load_from_memory(&tok, s_flash_rom + info.tokenizer_offset, info.tokenizer_size) == 0,
+    EXPECT(qmx_tokenizer_load_from_memory(&tok, s_flash_rom + (size_t)info.tokenizer_offset, (size_t)info.tokenizer_size) == 0,
            "Zero-Copy XIP tokenizer load");
     EXPECT(tok.is_xip == 1 && tok.merges_owned == 0, "XIP tokenizer uses 0 heap");
 

@@ -197,7 +197,7 @@ static void neon_matmul_tiled(float         * QMX_RESTRICT out,
     uint8x16_t one_u8 = vdupq_n_u8(1);
     uint8x16_t two_u8 = vdupq_n_u8(2);
 
-    float tile_acc[QMX_TILE_ROWS] QMX_ALIGNED(16);
+    QMX_ALIGNED(16) float tile_acc[QMX_TILE_ROWS];
 
     for (uint32_t tr = 0; tr < n_tr; tr++) {
         uint32_t r_base = tr * QMX_TILE_ROWS;
@@ -341,6 +341,38 @@ static int32_t neon_dot_q8(const int8_t  * QMX_RESTRICT q8,
     return sum;
 }
 
+static float neon_dot_f32_f16(const float * QMX_RESTRICT a,
+                              const uint16_t * QMX_RESTRICT b,
+                              uint32_t n) {
+    uint32_t i = 0;
+    float sum = 0.0f;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) || defined(__ARM_FP16_FORMAT_IEEE)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (; i + 3u < n; i += 4u) {
+        float32x4_t vb = vcvt_f32_f16(vld1_f16((const __fp16 *)(const void *)(b + i)));
+        acc = vmlaq_f32(acc, vld1q_f32(a + i), vb);
+    }
+    sum = neon_hsum_f32(acc);
+#endif
+    for (; i < n; i++) sum += a[i] * qmx_fp16_to_fp32(b[i]);
+    return sum;
+}
+
+static void neon_saxpy_f32_f16(float * QMX_RESTRICT y,
+                               float a,
+                               const uint16_t * QMX_RESTRICT x,
+                               uint32_t n) {
+    uint32_t i = 0;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) || defined(__ARM_FP16_FORMAT_IEEE)
+    float32x4_t va = vdupq_n_f32(a);
+    for (; i + 3u < n; i += 4u) {
+        float32x4_t vx = vcvt_f32_f16(vld1_f16((const __fp16 *)(const void *)(x + i)));
+        vst1q_f32(y + i, vmlaq_f32(vld1q_f32(y + i), va, vx));
+    }
+#endif
+    for (; i < n; i++) y[i] += a * qmx_fp16_to_fp32(x[i]);
+}
+
 #if defined(QMX_ENABLE_BACKEND_NEON_DOT) && defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
 #define QMX_HAS_NEON_DOT 1
 #if !defined(__ARM_FEATURE_DOTPROD)
@@ -442,7 +474,7 @@ static void neon_dot_matmul_tiled(float         * QMX_RESTRICT out,
     uint8x16_t one_u8 = vdupq_n_u8(1);
     uint8x16_t two_u8 = vdupq_n_u8(2);
 
-    float tile_acc[QMX_TILE_ROWS] QMX_ALIGNED(16);
+    QMX_ALIGNED(16) float tile_acc[QMX_TILE_ROWS];
 
     for (uint32_t tr = 0; tr < n_tr; tr++) {
         uint32_t r_base = tr * QMX_TILE_ROWS;
@@ -560,7 +592,12 @@ const QmxBackendOps qmx_ops_neon_dot = {
     NULL,
     qmx_swiglu_quant_scalar,
     neon_f16_to_f32,
-    neon_f32_to_f16
+    neon_f32_to_f16,
+    NULL,
+    NULL,
+    NULL,
+    neon_dot_f32_f16,
+    neon_saxpy_f32_f16
 };
 #endif
 
@@ -575,6 +612,11 @@ const QmxBackendOps qmx_ops_neon = {
     NULL,
     qmx_swiglu_quant_scalar,
     neon_f16_to_f32,
-    neon_f32_to_f16
+    neon_f32_to_f16,
+    NULL,
+    NULL,
+    NULL,
+    neon_dot_f32_f16,
+    neon_saxpy_f32_f16
 };
 #endif

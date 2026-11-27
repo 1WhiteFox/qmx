@@ -17,6 +17,9 @@
         #define QMX_THREAD_WIN32 1
         #define QMX_THREAD_POSIX 0
         #include <windows.h>
+        #if defined(_MSC_VER)
+            #include <intrin.h>
+        #endif
     #elif defined(__unix__) || defined(__APPLE__) || defined(__linux__)
         #define QMX_THREAD_WIN32 0
         #define QMX_THREAD_POSIX 1
@@ -64,8 +67,10 @@ struct QmxThreadPool {
     QmxJobFn        job_fn;
     void           *job_ctx;
     int             active_threads;
+    volatile int    main_waiting;
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
+    pthread_cond_t  done_cv;
 };
 
 static void *qmx_posix_worker(void *raw) {
@@ -111,7 +116,12 @@ static void *qmx_posix_worker(void *raw) {
         if (fn && tid < active) {
             fn(ctx, tid, active);
         }
-        __atomic_add_fetch(&p->done_count, 1, __ATOMIC_RELEASE);
+        int finished = __atomic_add_fetch(&p->done_count, 1, __ATOMIC_SEQ_CST);
+        if (finished >= p->num_threads - 1 && __atomic_load_n(&p->main_waiting, __ATOMIC_SEQ_CST)) {
+            pthread_mutex_lock(&p->mtx);
+            pthread_cond_signal(&p->done_cv);
+            pthread_mutex_unlock(&p->mtx);
+        }
     }
     return NULL;
 }
@@ -123,6 +133,7 @@ QmxThreadPool *qmx_pool_create(int num_threads) {
     if (!p) return NULL;
     pthread_mutex_init(&p->mtx, NULL);
     pthread_cond_init(&p->cv, NULL);
+    pthread_cond_init(&p->done_cv, NULL);
     p->num_threads = 1;
 
     for (int t = 1; t < num_threads; t++) {
@@ -135,6 +146,7 @@ QmxThreadPool *qmx_pool_create(int num_threads) {
         }
     }
     if (p->num_threads <= 1) {
+        pthread_cond_destroy(&p->done_cv);
         pthread_cond_destroy(&p->cv);
         pthread_mutex_destroy(&p->mtx);
         free(p);
@@ -153,6 +165,7 @@ void qmx_pool_destroy(QmxThreadPool *pool) {
     for (int t = 1; t < pool->num_threads; t++) {
         pthread_join(pool->workers[t], NULL);
     }
+    pthread_cond_destroy(&pool->done_cv);
     pthread_cond_destroy(&pool->cv);
     pthread_mutex_destroy(&pool->mtx);
     free(pool);
@@ -185,8 +198,21 @@ void qmx_pool_run(QmxThreadPool *pool, int active_threads, QmxJobFn fn, void *ct
     fn(ctx, 0, active_threads);
 
     int need = pool->num_threads - 1;
+    int spin = 0;
     while (__atomic_load_n(&pool->done_count, __ATOMIC_ACQUIRE) < need) {
-        qmx_cpu_relax();
+        if (spin < QMX_SPIN_ITERS) {
+            qmx_cpu_relax();
+            spin++;
+        } else {
+            pthread_mutex_lock(&pool->mtx);
+            __atomic_store_n(&pool->main_waiting, 1, __ATOMIC_SEQ_CST);
+            while (__atomic_load_n(&pool->done_count, __ATOMIC_SEQ_CST) < need) {
+                pthread_cond_wait(&pool->done_cv, &pool->mtx);
+            }
+            __atomic_store_n(&pool->main_waiting, 0, __ATOMIC_SEQ_CST);
+            pthread_mutex_unlock(&pool->mtx);
+            break;
+        }
     }
 }
 
@@ -202,7 +228,9 @@ typedef struct {
 struct QmxThreadPool {
     HANDLE        workers[QMX_MAX_THREADS];
     HANDLE        wake_events[QMX_MAX_THREADS];
+    HANDLE        done_event;
     volatile LONG worker_sleeping[QMX_MAX_THREADS];
+    volatile LONG main_waiting;
     QmxWorkerArg  args[QMX_MAX_THREADS];
     int           num_threads;
     volatile LONG shutdown;
@@ -254,7 +282,12 @@ static DWORD WINAPI qmx_win32_worker(LPVOID raw) {
         if (fn && tid < active) {
             fn(ctx, tid, active);
         }
-        InterlockedIncrement(&p->done_count);
+        LONG finished = InterlockedIncrement(&p->done_count);
+        if (finished >= (LONG)(p->num_threads - 1)) {
+            if (InterlockedCompareExchange(&p->main_waiting, 0, 1) == 1 && p->done_event) {
+                SetEvent(p->done_event);
+            }
+        }
     }
     return 0;
 }
@@ -264,6 +297,11 @@ QmxThreadPool *qmx_pool_create(int num_threads) {
     if (num_threads > QMX_MAX_THREADS) num_threads = QMX_MAX_THREADS;
     QmxThreadPool *p = (QmxThreadPool *)calloc(1, sizeof(QmxThreadPool));
     if (!p) return NULL;
+    p->done_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!p->done_event) {
+        free(p);
+        return NULL;
+    }
     p->num_threads = 1;
 
     for (int t = 1; t < num_threads; t++) {
@@ -281,6 +319,7 @@ QmxThreadPool *qmx_pool_create(int num_threads) {
         }
     }
     if (p->num_threads <= 1) {
+        if (p->done_event) CloseHandle(p->done_event);
         free(p);
         return NULL;
     }
@@ -302,6 +341,7 @@ void qmx_pool_destroy(QmxThreadPool *pool) {
             CloseHandle(pool->wake_events[t]);
         }
     }
+    if (pool->done_event) CloseHandle(pool->done_event);
     free(pool);
 }
 
@@ -332,8 +372,19 @@ void qmx_pool_run(QmxThreadPool *pool, int active_threads, QmxJobFn fn, void *ct
     fn(ctx, 0, active_threads);
 
     LONG need = (LONG)(pool->num_threads - 1);
+    int spin = 0;
     while (InterlockedCompareExchange(&pool->done_count, 0, 0) < need) {
-        qmx_cpu_relax();
+        if (spin < QMX_SPIN_ITERS) {
+            qmx_cpu_relax();
+            spin++;
+        } else {
+            InterlockedExchange(&pool->main_waiting, 1);
+            if (InterlockedCompareExchange(&pool->done_count, 0, 0) < need) {
+                WaitForSingleObject(pool->done_event, INFINITE);
+            } else {
+                InterlockedExchange(&pool->main_waiting, 0);
+            }
+        }
     }
 }
 

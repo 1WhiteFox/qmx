@@ -5,23 +5,37 @@
 
 #include "../include/qmx_kernels.h"
 
-#if defined(QMX_ENABLE_BACKEND_3DNOW) && (defined(__i386__) || defined(__x86_64__)) && (defined(__3dNOW__) || defined(__3dnow__))
+#if defined(QMX_ENABLE_BACKEND_3DNOW) && (defined(__i386__) || defined(__x86_64__)) && (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__3dNOW__) || defined(__3dnow__) || defined(__clang__) || \
+     (defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 9))))
+
+#if !defined(__3dNOW__) && !defined(__3dnow__)
+    #define QMX_3DNOW_TARGET __attribute__((target("3dnow")))
+#else
+    #define QMX_3DNOW_TARGET
+#endif
 
 
-static const uint64_t g_3dn_q4_mask_0f   QMX_ALIGNED(8) = 0x0F0F0F0F0F0F0F0FULL;
-static const uint64_t g_3dn_q4_bias_08   QMX_ALIGNED(8) = 0x0808080808080808ULL;
+static QMX_ALIGNED(8) const uint64_t g_3dn_q4_mask_0f = 0x0F0F0F0F0F0F0F0FULL;
+static QMX_ALIGNED(8) const uint64_t g_3dn_q4_bias_08 = 0x0808080808080808ULL;
 
 
 #define QMX_FEMMS() \
     __asm__ volatile ("femms" : : : "st", "st(1)", "st(2)", "st(3)", "st(4)", "st(5)", "st(6)", "st(7)", "memory")
 
+QMX_3DNOW_TARGET
+static void threednow_femms(void) {
+    QMX_FEMMS();
+}
+
+QMX_3DNOW_TARGET
 static void threednow_prepare_act(const float * QMX_RESTRICT x,
                                   int8_t      * QMX_RESTRICT xq,
                                   int16_t     * QMX_RESTRICT xq16,
                                   float       * QMX_RESTRICT x_scales,
                                   uint32_t cols) {
     qmx_quantize_activations_q8(x, xq, x_scales, cols);
-    uint32_t pad_cols = (uint32_t)qmx_align_up(cols, QMX_TILE_COLS);
+    uint32_t pad_cols = (cols + (QMX_TILE_COLS - 1u)) & ~(QMX_TILE_COLS - 1u);
     for (uint32_t i = 0; i < pad_cols; i += 8u) {
         const int8_t *src = xq + i;
         int16_t *dst = xq16 + i;
@@ -41,6 +55,7 @@ static void threednow_prepare_act(const float * QMX_RESTRICT x,
     QMX_FEMMS();
 }
 
+QMX_3DNOW_TARGET
 static void threednow_rmsnorm(float       * QMX_RESTRICT out,
                               const float * QMX_RESTRICT x,
                               const float * QMX_RESTRICT weight,
@@ -107,6 +122,7 @@ static void threednow_rmsnorm(float       * QMX_RESTRICT out,
     for (; j < size; j++) out[j] = weight[j] * (inv_sqrt * x[j]);
 }
 
+QMX_3DNOW_TARGET
 static float threednow_dot_f32(const float * QMX_RESTRICT a,
                                const float * QMX_RESTRICT b,
                                uint32_t n) {
@@ -137,6 +153,7 @@ static float threednow_dot_f32(const float * QMX_RESTRICT a,
     return sum;
 }
 
+QMX_3DNOW_TARGET
 static void threednow_saxpy_f32(float       * QMX_RESTRICT y,
                                 float a,
                                 const float * QMX_RESTRICT x,
@@ -166,6 +183,7 @@ static void threednow_saxpy_f32(float       * QMX_RESTRICT y,
     for (; i < n; i++) y[i] += a * x[i];
 }
 
+QMX_3DNOW_TARGET
 static int32_t threednow_dot_q8(const int8_t  * QMX_RESTRICT q8,
                                 const int16_t * QMX_RESTRICT q16,
                                 const int8_t  * QMX_RESTRICT k8,
@@ -202,6 +220,7 @@ static int32_t threednow_dot_q8(const int8_t  * QMX_RESTRICT q8,
     return sum;
 }
 
+QMX_3DNOW_TARGET
 QMX_INLINE void threednow_lut_step_2rows(const int16_t *x_ptr,
                                          const int16_t *l0a, const int16_t *l0b,
                                          const int16_t *l1a, const int16_t *l1b,
@@ -249,6 +268,7 @@ static inline uint32_t threednow_fp16_to_f32_bits(uint16_t h) {
     return sign | ((exp + 112u) << 23u) | (mant << 13u);
 }
 
+QMX_3DNOW_TARGET
 QMX_INLINE void threednow_scale_accum_2rows(float *acc_pair_ptr,
                                             const uint64_t *acc0,
                                             const uint64_t *acc1,
@@ -274,6 +294,7 @@ QMX_INLINE void threednow_scale_accum_2rows(float *acc_pair_ptr,
     );
 }
 
+QMX_3DNOW_TARGET
 QMX_INLINE void threednow_scale_accum_2rows_pair(float *acc_pair_ptr,
                                                  const uint64_t *acc0,
                                                  const uint64_t *acc1,
@@ -299,6 +320,7 @@ QMX_INLINE void threednow_scale_accum_2rows_pair(float *acc_pair_ptr,
     );
 }
 
+QMX_3DNOW_TARGET
 static void threednow_accum_tile(float *tile_acc16,
                                  const uint8_t *tile_ptr,
                                  const int16_t *xq16_32,
@@ -425,8 +447,8 @@ static void threednow_matmul_tiled(float         * QMX_RESTRICT out,
     const uint8_t *base_data = (const uint8_t *)w->data;
     const uint16_t *scales_f16 = (const uint16_t *)(const void *)w->scales;
 
-    uint32_t tile_acc_u32[QMX_TILE_ROWS] QMX_ALIGNED(8);
-    uint32_t row_sc_u32[QMX_TILE_ROWS] QMX_ALIGNED(8);
+    QMX_ALIGNED(8) uint32_t tile_acc_u32[QMX_TILE_ROWS];
+    QMX_ALIGNED(8) uint32_t row_sc_u32[QMX_TILE_ROWS];
     float *tile_acc = (float *)(void *)tile_acc_u32;
     const uint32_t *out_u32 = (const uint32_t *)(const void *)out;
     uint32_t *out_u32_mut = (uint32_t *)(void *)out;
@@ -458,7 +480,7 @@ static void threednow_matmul_tiled(float         * QMX_RESTRICT out,
             }
         }
     }
-    QMX_FEMMS();
+    threednow_femms();
 }
 
 const QmxBackendOps qmx_ops_3dnow = {
@@ -472,6 +494,11 @@ const QmxBackendOps qmx_ops_3dnow = {
     NULL,
     qmx_swiglu_quant_scalar,
     qmx_f16_to_f32_scalar,
-    qmx_f32_to_f16_scalar
+    qmx_f32_to_f16_scalar,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 #endif

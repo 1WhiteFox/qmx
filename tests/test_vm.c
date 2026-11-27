@@ -124,6 +124,34 @@ int main(int argc, char **argv) {
         return 1;
     }
     qmx_free(&m_kv8);
+
+    QmxModel m_long_f32, m_long_f16;
+    if (qmx_load(&m_long_f32, path, 128, QMX_BACKEND_AUTO, QMX_KV_FP32, 0, 0) != 0 ||
+        qmx_load(&m_long_f16, path, 128, QMX_BACKEND_AUTO, QMX_KV_FP16, 0, 0) != 0) {
+        fprintf(stderr, "[FAIL] Could not load models for multi-block FlashAttention check\n");
+        free(ref_logits);
+        return 1;
+    }
+    qmx_set_num_threads(&m_long_f32, 2);
+    qmx_set_num_threads(&m_long_f16, 2);
+    int long_seq[80];
+    for (int i = 0; i < 80; i++) long_seq[i] = 1 + ((i * 37) % (int)(vocab - 1u));
+    float *lf32 = qmx_forward_batch(&m_long_f32, long_seq, 80, 0, NULL);
+    float *lf16 = qmx_forward_batch(&m_long_f16, long_seq, 80, 0, NULL);
+    float max_diff_flash = 0.0f;
+    for (uint32_t i = 0; i < vocab; i++) {
+        float d = fabsf(lf32[i] - lf16[i]);
+        if (d > max_diff_flash) max_diff_flash = d;
+    }
+    if (isnan(max_diff_flash) || max_diff_flash > 0.02f || m_long_f16.mt_att_buf != NULL) {
+        fprintf(stderr, "[FAIL] Multi-block FlashAttention mismatch: diff=%.6f\n", (double)max_diff_flash);
+        qmx_free(&m_long_f32);
+        qmx_free(&m_long_f16);
+        free(ref_logits);
+        return 1;
+    }
+    qmx_free(&m_long_f32);
+    qmx_free(&m_long_f16);
     free(ref_logits);
 
     printf("[PASS] Stage 2.2 QMX VM test passed! (chk=%.6f, stream_diff=%.2e, kv8_diff=%.4f)\n",

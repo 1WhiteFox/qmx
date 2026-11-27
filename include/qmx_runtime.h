@@ -7,6 +7,34 @@
 #define QMX_RUNTIME_H
 
 #include "qmx.h"
+
+#define QMX_QID_BINARY_1BIT 1
+#define QMX_QID_TERNARY_158 2
+#define QMX_QID_Q4_SYM      3
+#define QMX_QID_Q8_SYM      4
+#define QMX_QID_FP32        5
+#define QMX_QID_Q4_ROW32    6
+#define QMX_QID_Q8_ROW32    7
+
+#if defined(QMX_ONLY_BINARY) && !defined(QMX_ONLY_QUANT)
+    #define QMX_ONLY_QUANT QMX_QID_BINARY_1BIT
+#elif defined(QMX_ONLY_TERNARY) && !defined(QMX_ONLY_QUANT)
+    #define QMX_ONLY_QUANT QMX_QID_TERNARY_158
+#elif defined(QMX_ONLY_Q4_SYM) && !defined(QMX_ONLY_QUANT)
+    #define QMX_ONLY_QUANT QMX_QID_Q4_SYM
+#elif defined(QMX_ONLY_Q8_SYM) && !defined(QMX_ONLY_QUANT)
+    #define QMX_ONLY_QUANT QMX_QID_Q8_SYM
+#elif defined(QMX_ONLY_Q4_R32) && !defined(QMX_ONLY_QUANT)
+    #define QMX_ONLY_QUANT QMX_QID_Q4_ROW32
+#elif defined(QMX_ONLY_Q8_R32) && !defined(QMX_ONLY_QUANT)
+    #define QMX_ONLY_QUANT QMX_QID_Q8_ROW32
+#endif
+
+#ifdef QMX_ONLY_QUANT
+    #define QMX_HAS_QUANT(qid) ((qid) == (QMX_ONLY_QUANT))
+#else
+    #define QMX_HAS_QUANT(qid) 1
+#endif
 #include "qmx_thread.h"
 
 #ifdef __cplusplus
@@ -17,7 +45,11 @@ extern "C" {
     #include <xmmintrin.h>
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__DJGPP__)
+    #define QMX_ALIGNED(x) __attribute__((aligned((x) > 16 ? 16 : (x))))
+    #define QMX_RESTRICT   __restrict__
+    #define QMX_INLINE     static inline __attribute__((always_inline))
+#elif defined(__GNUC__) || defined(__clang__)
     #define QMX_ALIGNED(x) __attribute__((aligned(x)))
     #define QMX_RESTRICT   __restrict__
     #define QMX_INLINE     static inline __attribute__((always_inline))
@@ -42,6 +74,31 @@ typedef union {
 QMX_INLINE size_t qmx_align_up(size_t val, size_t align) {
     size_t rem = val % align;
     return (rem == 0) ? val : (val + (align - rem));
+}
+
+QMX_INLINE int qmx_checked_add_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (a > (~(uint64_t)0) - b) return -1;
+    *out = a + b;
+    return 0;
+}
+
+QMX_INLINE int qmx_checked_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (a != 0u && b > (~(uint64_t)0) / a) return -1;
+    *out = a * b;
+    return 0;
+}
+
+QMX_INLINE int qmx_align_up64_checked(uint64_t val, uint64_t align, uint64_t *out) {
+    if (align <= 1u) {
+        *out = val;
+        return 0;
+    }
+    uint64_t rem = val % align;
+    if (rem == 0u) {
+        *out = val;
+        return 0;
+    }
+    return qmx_checked_add_u64(val, align - rem, out);
 }
 
 QMX_INLINE int32_t qmx_round_nearest_i32(float v) {
@@ -122,6 +179,20 @@ QMX_INLINE float qmx_sqrtf(float x) {
 }
 
 QMX_INLINE float qmx_expf(float x) {
+#ifdef QMX_TINY_MATH
+    if (x < -87.0f) return 0.0f;
+    if (x >  88.0f) x = 88.0f;
+    float fx = x * 1.44269504f;
+    int32_t k = (int32_t)(fx >= 0.0f ? (fx + 0.5f) : (fx - 0.5f));
+    float r = x - (float)k * 0.69314718f;
+    float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * (0.04166667f + r * 0.00833333f))));
+    int32_t e = k + 127;
+    if (e <= 0) return 0.0f;
+    if (e >= 255) e = 254;
+    union { uint32_t u; float f; } u;
+    u.u = (uint32_t)e << 23u;
+    return p * u.f;
+#else
     if (x > 88.0f) return 3.402823466e+38f;
     if (x < -87.3f) return 0.0f;
     QmxFloatBits kd, res;
@@ -136,8 +207,9 @@ QMX_INLINE float qmx_expf(float x) {
     p = p * r + 5.0f * 1e-1f;
     p = p * (r * r) + r + 1.0f;
     res.f = p;
-    res.i += (k << 23);
+    res.u += ((uint32_t)k << 23u);
     return res.f;
+#endif
 }
 
 QMX_INLINE void qmx_sincosf(float val, float * QMX_RESTRICT s_out, float * QMX_RESTRICT c_out) {
@@ -183,12 +255,15 @@ typedef struct {
     size_t   capacity;
     size_t   offset;
     int      is_external;
+    int      failed;
 } QmxArena;
 
 typedef struct {
     float    *slots[QMX_MAX_ARENA_SLOTS];
     int8_t   *xq;
     int16_t  *xq16;
+    int8_t   *xq_eo;
+    int32_t  *x_sums;
     float    *x_scales;
     float    *rope_inv_freq;
     float    *rope_cos;
@@ -233,6 +308,10 @@ typedef struct {
     const QmxTensor    **recipe_tensors;
     uint32_t            *recipe_quant_cols;
     uint8_t             *recipe_fuse;
+    uint8_t              qkv_fuse_valid;
+    uint8_t              qkv_fuse_start;
+    uint8_t              qkv_fuse_end;
+    uint8_t              qkv_fuse_pc[3];
     const QmxTensor     *tok_emb_tensor;
     const QmxTensor     *rms_final_tensor;
     const QmxTensor     *rms_final_bias_tensor;
@@ -272,6 +351,7 @@ int64_t qmx_ftell64(FILE *fp);
 int64_t qmx_file_size64(FILE *fp);
 #endif
 
+uint32_t qmx_crc32_update(uint32_t crc, const void *data, size_t len);
 uint32_t qmx_crc32(const void *data, size_t len);
 size_t   qmx_tile_data_bytes(uint8_t quant_type);
 size_t   qmx_tile_row_bytes(uint8_t quant_type);
@@ -301,9 +381,10 @@ void qmx_rope_apply_partial(float * QMX_RESTRICT q, float * QMX_RESTRICT k,
                             uint32_t q_dim, uint32_t kv_dim, uint32_t head_size,
                             uint32_t rotary_dim, int split_half);
 
-#define QMX_FUSE_NONE          0u
-#define QMX_FUSE_RMSNORM_QUANT 1u
-#define QMX_FUSE_SWIGLU_QUANT  2u
+#define QMX_FUSE_NONE               0u
+#define QMX_FUSE_RMSNORM_QUANT      1u
+#define QMX_FUSE_SWIGLU_QUANT       2u
+#define QMX_FUSE_FFN_GATE_UP_SWIGLU 3u
 
 void qmx_quantize_activations_q8(const float * QMX_RESTRICT x,
                                  int8_t      * QMX_RESTRICT xq,
@@ -327,6 +408,8 @@ void qmx_swiglu_quant_scalar(const float * QMX_RESTRICT gate,
 
 void qmx_f16_to_f32_scalar(float * QMX_RESTRICT dst, const uint16_t * QMX_RESTRICT src, uint32_t n);
 void qmx_f32_to_f16_scalar(uint16_t * QMX_RESTRICT dst, const float * QMX_RESTRICT src, uint32_t n);
+float qmx_dot_f32_f16_scalar(const float * QMX_RESTRICT a, const uint16_t * QMX_RESTRICT b, uint32_t n);
+void qmx_saxpy_f32_f16_scalar(float * QMX_RESTRICT y, float a, const uint16_t * QMX_RESTRICT x, uint32_t n);
 
 void qmx_dequantize_tiled_row(float * QMX_RESTRICT out,
                               const QmxTensor *w,
@@ -345,6 +428,10 @@ QmxLoadParams qmx_load_params_default(void);
 size_t qmx_calc_arena_size(const QmxReader *reader, const QmxLoadParams *params, int is_xip);
 size_t qmx_calc_arena_size_memory(const void *cartridge_mem, size_t cartridge_size, const QmxLoadParams *params);
 
+int qmx_verify_crc_reader(const QmxReader *reader, uint32_t *out_stored, uint32_t *out_calc);
+int qmx_verify_crc_memory(const void *cartridge_mem, size_t cartridge_size,
+                          uint32_t *out_stored, uint32_t *out_calc);
+
 int qmx_load_from_reader(QmxModel *model, QmxReader reader, const QmxLoadParams *params);
 
 int qmx_load_from_memory_ex(QmxModel *model, const void *cartridge_mem, size_t cartridge_size,
@@ -354,6 +441,9 @@ int qmx_load_from_memory(QmxModel *model, const void *cartridge_mem, size_t cart
                          uint32_t override_max_seq, QmxBackend backend, int kv_mode);
 
 #ifndef QMX_NO_STDIO
+int qmx_verify_crc_file(const char *path, uint64_t base_offset, uint64_t slice_size,
+                        uint32_t *out_stored, uint32_t *out_calc);
+
 int qmx_load_ex(QmxModel *model, const char *path, uint64_t base_offset, uint64_t slice_size,
                 const QmxLoadParams *params);
 
@@ -386,6 +476,11 @@ void qmx_get_stats(const QmxModel *model, QmxStats *out);
 void qmx_reset_stats(QmxModel *model);
 
 void qmx_set_num_threads(QmxModel *model, int num_threads);
+
+int        qmx_detect_physical_cores(void);
+uint64_t   qmx_detect_avail_ram_bytes(void);
+int        qmx_recommend_threads(const QmxModel *model);
+QmxBackend qmx_autotune_backend(uint32_t dim, uint32_t inter_dim);
 
 void qmx_free(QmxModel *model);
 

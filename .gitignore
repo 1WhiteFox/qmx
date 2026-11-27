@@ -5,8 +5,8 @@ dist_retro/
 *.o
 *.a
 *.exe
-qmx
-qmx-term
+/qmx
+/qmx-term
 qmx_p54c
 qmx_mmx
 qmx_3dnow
@@ -22,3 +22,11 @@ QMX.CFG
 __pycache__/
 *.pyc
 *repomix*.xml
+
+# Local build binaries, dumps & standalone demos
+/qmx-ppl
+repomix_parts/
+dist_486/
+dist_486.zip
+stm32_qmx/
+stm32_qmx.zip

@@ -150,7 +150,7 @@ TID_FFN_SUBNORM    = 0x0204
 TID_FFN_NORM_BIAS  = 0x0205
 TID_FFN_POST_NORM  = 0x0206
 
-HEADER_FMT = "<IHHIIIIIIIIIIIIIIHHHHffIIIHHffffBBH12s"
+HEADER_FMT = "<IHHIIIIIIIIIIIIIIHHHHffIIIHHffffBBHI8s"
 DESC_FMT = "<32sHHBBHIIIIIHH"
 assert struct.calcsize(HEADER_FMT) == 128
 assert struct.calcsize(DESC_FMT) == 64
@@ -170,11 +170,168 @@ def pad_file(fp, alignment: int) -> int:
     return pos
 
 
-def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bool = False):
-    """
-    Pads a 2D float32 matrix to (16, 32) multiples, arranges into Tile-Major 16x32
-    blocks, and returns (scales_bytes, data_bytes, padded_rows, padded_cols).
-    """
+def _parse_imatrix_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict):
+        if "imatrix" in obj and isinstance(obj["imatrix"], dict):
+            obj = obj["imatrix"]
+        elif "data" in obj and isinstance(obj["data"], dict):
+            obj = obj["data"]
+    if not isinstance(obj, dict):
+        raise ValueError(f"Unsupported JSON imatrix structure in {path}")
+    out = {}
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            vals = v.get("values", v.get("sum2", v.get("data")))
+            ncall = float(v.get("ncall", v.get("counts", 1.0)) or 1.0)
+            if vals is not None:
+                arr = np.asarray(vals, dtype=np.float32).reshape(-1)
+                if ncall > 0.0:
+                    arr = arr / ncall
+                out[str(k)] = arr
+        elif isinstance(v, (list, tuple)):
+            out[str(k)] = np.asarray(v, dtype=np.float32).reshape(-1)
+    return out
+
+
+def _parse_imatrix_dat(path: str) -> dict:
+    out = {}
+    with open(path, "rb") as f:
+        hdr = f.read(4)
+        if len(hdr) < 4:
+            raise ValueError(f"Truncated imatrix.dat: {path}")
+        if hdr == b"GGUF":
+            return _parse_imatrix_gguf(path)
+        n_entries = struct.unpack("<i", hdr)[0]
+        if n_entries <= 0 or n_entries > 100000:
+            raise ValueError(f"Invalid imatrix.dat entry count {n_entries} in {path}")
+        for _ in range(n_entries):
+            raw_nlen = f.read(4)
+            if len(raw_nlen) < 4:
+                break
+            nlen = struct.unpack("<i", raw_nlen)[0]
+            if nlen <= 0 or nlen > 4096:
+                raise ValueError(f"Invalid tensor name length {nlen} in {path}")
+            name = f.read(nlen).decode("utf-8", errors="ignore")
+            meta = f.read(8)
+            if len(meta) < 8:
+                raise ValueError(f"Truncated imatrix.dat entry '{name}' in {path}")
+            ncall, nval = struct.unpack("<ii", meta)
+            if nval < 0 or nval > 1048576:
+                raise ValueError(f"Invalid imatrix.dat vector size {nval} for '{name}'")
+            raw_vals = f.read(nval * 4)
+            if len(raw_vals) != nval * 4:
+                raise ValueError(f"Truncated imatrix.dat values for '{name}'")
+            arr = np.frombuffer(raw_vals, dtype=np.float32).copy()
+            if ncall > 0:
+                arr /= float(ncall)
+            out[name] = arr
+    return out
+
+
+def _parse_imatrix_txt(path: str) -> dict:
+    out = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if ":" in s:
+                name, rest = s.split(":", 1)
+                parts = rest.replace(",", " ").split()
+            else:
+                toks = s.split()
+                if len(toks) < 2:
+                    continue
+                name, parts = toks[0], toks[1:]
+            vals = [float(x) for x in parts]
+            if vals:
+                out[name.strip()] = np.asarray(vals, dtype=np.float32)
+    return out
+
+
+def load_imatrix(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"imatrix file not found: {path}")
+    low = path.lower()
+    if low.endswith(".json"):
+        return _parse_imatrix_json(path)
+    if low.endswith(".npz"):
+        npz = np.load(path)
+        return {k: np.asarray(npz[k], dtype=np.float32).reshape(-1) for k in npz.files}
+    if low.endswith(".txt"):
+        return _parse_imatrix_txt(path)
+    if low.endswith(".gguf"):
+        return _parse_imatrix_gguf(path)
+    with open(path, "rb") as f:
+        head = f.read(16)
+    if head.startswith(b"GGUF"):
+        return _parse_imatrix_gguf(path)
+    if head.lstrip().startswith(b"{"):
+        return _parse_imatrix_json(path)
+    return _parse_imatrix_dat(path)
+
+
+def _imatrix_candidates(qmx_name: str) -> list:
+    cands = [qmx_name]
+    if not qmx_name.endswith(".weight"):
+        cands.append(qmx_name + ".weight")
+    if qmx_name == "token_emb.weight":
+        cands.extend([
+            "token_embd.weight",
+            "model.embed_tokens.weight",
+            "language_model.model.embed_tokens.weight",
+            "embed_tokens.weight",
+        ])
+    elif qmx_name == "lm_head.weight":
+        cands.extend([
+            "output.weight",
+            "language_model.lm_head.weight",
+        ])
+    elif qmx_name.startswith("blk."):
+        parts = qmx_name.split(".")
+        if len(parts) == 3:
+            lidx, role = parts[1], parts[2]
+            gguf_role = {
+                "attn_q": "attn_q",
+                "attn_k": "attn_k",
+                "attn_v": "attn_v",
+                "attn_wo": "attn_output",
+                "ffn_gate": "ffn_gate",
+                "ffn_up": "ffn_up",
+                "ffn_down": "ffn_down",
+            }.get(role)
+            if gguf_role:
+                cands.append(f"blk.{lidx}.{gguf_role}.weight")
+                cands.append(f"blk.{lidx}.{gguf_role}")
+            hf_role = {
+                "attn_q": "self_attn.q_proj.weight",
+                "attn_k": "self_attn.k_proj.weight",
+                "attn_v": "self_attn.v_proj.weight",
+                "attn_wo": "self_attn.o_proj.weight",
+                "ffn_gate": "mlp.gate_proj.weight",
+                "ffn_up": "mlp.up_proj.weight",
+                "ffn_down": "mlp.down_proj.weight",
+            }.get(role)
+            if hf_role:
+                cands.append(f"model.layers.{lidx}.{hf_role}")
+                cands.append(f"language_model.model.layers.{lidx}.{hf_role}")
+                cands.append(f"layers.{lidx}.{hf_role}")
+    return cands
+
+
+def resolve_imatrix_vector(imatrix_map, qmx_name: str, expected_cols: int):
+    if not imatrix_map:
+        return None
+    for key in _imatrix_candidates(qmx_name):
+        vec = imatrix_map.get(key)
+        if vec is not None and vec.ndim == 1 and vec.shape[0] == expected_cols:
+            return vec
+    return None
+
+
+def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bool = False, importance=None):
     assert mat.ndim == 2
     orig_rows, orig_cols = mat.shape
     pad_r = (TILE_ROWS - (orig_rows % TILE_ROWS)) % TILE_ROWS
@@ -186,9 +343,21 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
     n_tr = rows // TILE_ROWS
     n_tc = cols // TILE_COLS
 
-    # Reshape into (n_tr, n_tc, 16, 32) -> (num_tiles, 512)
     tiles = mat.reshape(n_tr, TILE_ROWS, n_tc, TILE_COLS).transpose(0, 2, 1, 3).reshape(-1, 512)
     num_tiles = tiles.shape[0]
+
+    imp_tc = None
+    if importance is not None:
+        imp_vec = np.asarray(importance, dtype=np.float32).reshape(-1)
+        if imp_vec.shape[0] == orig_cols:
+            imp_vec = np.where(np.isfinite(imp_vec) & (imp_vec > 0.0), imp_vec, 0.0)
+            pos_mask = imp_vec > 0.0
+            if np.any(pos_mask):
+                imp_vec = imp_vec / float(np.mean(imp_vec[pos_mask]))
+                imp_vec = np.maximum(imp_vec, 1e-4).astype(np.float32)
+                if pad_c > 0:
+                    imp_vec = np.pad(imp_vec, (0, pad_c), mode="constant", constant_values=0.0)
+                imp_tc = imp_vec.reshape(n_tc, TILE_COLS)
 
     global_gamma = max(float(np.mean(np.abs(tiles))), 1e-6) if per_tensor_scale else 0.0
 
@@ -198,10 +367,26 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
 
     for start in range(0, num_tiles, chunk_tiles):
         blk = tiles[start : start + chunk_tiles].astype(np.float32, copy=False)
+        n_blk = blk.shape[0]
+        imp_512 = None
+        imp_r32 = None
+        if imp_tc is not None:
+            tc_idx = np.arange(start, start + n_blk, dtype=np.int64) % n_tc
+            imp_rows = imp_tc[tc_idx]
+            imp_512 = np.broadcast_to(imp_rows[:, None, :], (n_blk, TILE_ROWS, TILE_COLS)).reshape(n_blk, 512)
+            imp_r32 = np.broadcast_to(imp_rows[:, None, :], (n_blk, TILE_ROWS, TILE_COLS)).reshape(-1, TILE_COLS)
 
         if quant_type == QMX_QUANT_BINARY_1BIT:
             if per_tensor_scale:
-                sc = np.full((blk.shape[0], 1), global_gamma, dtype=np.float32)
+                sc = np.full((n_blk, 1), global_gamma, dtype=np.float32)
+            elif imp_512 is not None:
+                w_sum = np.sum(imp_512, axis=1, keepdims=True)
+                sc = np.where(
+                    w_sum > 0.0,
+                    np.sum(imp_512 * np.abs(blk), axis=1, keepdims=True) / w_sum,
+                    np.mean(np.abs(blk), axis=1, keepdims=True),
+                )
+                sc = np.maximum(sc, 1e-8).astype(np.float32)
             else:
                 sc = np.maximum(np.mean(np.abs(blk), axis=1, keepdims=True), 1e-8).astype(np.float32)
             bits = (blk >= 0.0).astype(np.uint8).reshape(-1, 8)
@@ -213,12 +398,38 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
 
         elif quant_type == QMX_QUANT_TERNARY_158:
             if per_tensor_scale:
-                sc = np.full((blk.shape[0], 1), global_gamma, dtype=np.float32)
+                sc = np.full((n_blk, 1), global_gamma, dtype=np.float32)
                 best_q = np.clip(np.round(blk / sc), -1.0, 1.0).astype(np.int8)
+            elif imp_512 is not None:
+                abs_blk = np.abs(blk)
+                max_abs = np.max(abs_blk, axis=1, keepdims=True)
+                w_sum = np.sum(imp_512, axis=1, keepdims=True)
+                best_score = np.full((n_blk, 1), -1.0, dtype=np.float32)
+                best_sc = np.maximum(
+                    np.where(w_sum > 0.0, np.sum(imp_512 * abs_blk, axis=1, keepdims=True) / w_sum, np.mean(abs_blk, axis=1, keepdims=True)),
+                    1e-8,
+                ).astype(np.float32)
+                best_q = np.clip(np.round(blk / best_sc), -1.0, 1.0).astype(np.int8)
+
+                for beta in np.linspace(0.10, 0.65, 16, dtype=np.float32):
+                    thr = max_abs * beta
+                    mask = abs_blk > thr
+                    qq = np.sum(imp_512 * mask, axis=1, keepdims=True)
+                    wq = np.sum(imp_512 * abs_blk * mask, axis=1, keepdims=True)
+                    sc_cand = np.where(qq > 0.0, wq / qq, 0.0)
+                    score = wq * sc_cand
+                    improve = score > best_score
+                    if np.any(improve):
+                        best_score = np.where(improve, score, best_score)
+                        best_sc = np.where(improve, sc_cand, best_sc)
+                        q_cand = np.where(blk > thr, 1, np.where(blk < -thr, -1, 0)).astype(np.int8)
+                        best_q = np.where(improve, q_cand, best_q)
+
+                sc = np.maximum(best_sc, 1e-8).astype(np.float32)
             else:
                 abs_blk = np.abs(blk)
                 max_abs = np.max(abs_blk, axis=1, keepdims=True)
-                best_score = np.full((blk.shape[0], 1), -1.0, dtype=np.float32)
+                best_score = np.full((n_blk, 1), -1.0, dtype=np.float32)
                 best_sc = np.maximum(np.mean(abs_blk, axis=1, keepdims=True), 1e-8).astype(np.float32)
                 best_q = np.clip(np.round(blk / best_sc), -1.0, 1.0).astype(np.int8)
 
@@ -254,24 +465,51 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
         elif quant_type == QMX_QUANT_Q4_SYM:
             with np.errstate(divide="ignore", invalid="ignore"):
                 max_abs = np.max(np.abs(blk), axis=1, keepdims=True)
-                best_score = np.full((blk.shape[0], 1), -1.0, dtype=np.float32)
+                best_score = np.full((n_blk, 1), -1.0, dtype=np.float32)
                 best_sc = (max_abs / 7.0).astype(np.float32)
                 inv_init = np.where(best_sc == 0.0, 0.0, 1.0 / best_sc)
                 best_q = np.clip(np.round(blk * inv_init), -8.0, 7.0).astype(np.int8)
 
-                for alpha in np.linspace(0.68, 1.00, 13, dtype=np.float32):
-                    sc_try = (max_abs * alpha) / 7.5
-                    inv_try = np.where(sc_try == 0.0, 0.0, 1.0 / sc_try)
-                    q_try = np.clip(np.round(blk * inv_try), -8.0, 7.0)
-                    wq = np.sum(blk * q_try, axis=1, keepdims=True)
-                    qq = np.sum(q_try * q_try, axis=1, keepdims=True)
-                    sc_opt = np.where(qq > 0.0, wq / qq, 0.0)
-                    score = wq * sc_opt
-                    improve = score > best_score
-                    if np.any(improve):
-                        best_score = np.where(improve, score, best_score)
-                        best_sc = np.where(improve, sc_opt, best_sc)
-                        best_q = np.where(improve, q_try.astype(np.int8), best_q)
+                if imp_512 is not None:
+                    w_blk = imp_512 * blk
+                    alphas = np.linspace(0.55, 1.00, 19, dtype=np.float32)
+                    for alpha in alphas:
+                        sc_try = (max_abs * alpha) / 7.5
+                        inv_try = np.where(sc_try == 0.0, 0.0, 1.0 / sc_try)
+                        q_try = np.clip(np.round(blk * inv_try), -8.0, 7.0)
+                        wq = np.sum(w_blk * q_try, axis=1, keepdims=True)
+                        qq = np.sum(imp_512 * q_try * q_try, axis=1, keepdims=True)
+                        sc_opt = np.where(qq > 0.0, wq / qq, 0.0)
+                        score = wq * sc_opt
+                        improve = (score > best_score) & (sc_opt >= 0.0)
+                        if np.any(improve):
+                            best_score = np.where(improve, score, best_score)
+                            best_sc = np.where(improve, sc_opt, best_sc)
+                            best_q = np.where(improve, q_try.astype(np.int8), best_q)
+                    inv_ref = np.where(best_sc > 0.0, 1.0 / best_sc, 0.0)
+                    q_ref = np.clip(np.round(blk * inv_ref), -8.0, 7.0)
+                    wq_ref = np.sum(w_blk * q_ref, axis=1, keepdims=True)
+                    qq_ref = np.sum(imp_512 * q_ref * q_ref, axis=1, keepdims=True)
+                    sc_ref = np.where(qq_ref > 0.0, wq_ref / qq_ref, 0.0)
+                    score_ref = wq_ref * sc_ref
+                    imp_ref = (score_ref > best_score) & (sc_ref >= 0.0)
+                    if np.any(imp_ref):
+                        best_sc = np.where(imp_ref, sc_ref, best_sc)
+                        best_q = np.where(imp_ref, q_ref.astype(np.int8), best_q)
+                else:
+                    for alpha in np.linspace(0.68, 1.00, 13, dtype=np.float32):
+                        sc_try = (max_abs * alpha) / 7.5
+                        inv_try = np.where(sc_try == 0.0, 0.0, 1.0 / sc_try)
+                        q_try = np.clip(np.round(blk * inv_try), -8.0, 7.0)
+                        wq = np.sum(blk * q_try, axis=1, keepdims=True)
+                        qq = np.sum(q_try * q_try, axis=1, keepdims=True)
+                        sc_opt = np.where(qq > 0.0, wq / qq, 0.0)
+                        score = wq * sc_opt
+                        improve = score > best_score
+                        if np.any(improve):
+                            best_score = np.where(improve, score, best_score)
+                            best_sc = np.where(improve, sc_opt, best_sc)
+                            best_q = np.where(improve, q_try.astype(np.int8), best_q)
 
             u = (best_q + 8).astype(np.uint8).reshape(-1, 2)
             packed = (u[:, 0] | (u[:, 1] << 4)).astype(np.uint8)
@@ -287,19 +525,45 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
                 inv_init = np.where(best_sc == 0.0, 0.0, 1.0 / best_sc)
                 best_q = np.clip(np.round(rows32 * inv_init), -8.0, 7.0).astype(np.int8)
 
-                for alpha in np.linspace(0.72, 1.00, 9, dtype=np.float32):
-                    sc_try = (max_abs * alpha) / 7.5
-                    inv_try = np.where(sc_try == 0.0, 0.0, 1.0 / sc_try)
-                    q_try = np.clip(np.round(rows32 * inv_try), -8.0, 7.0)
-                    wq = np.sum(rows32 * q_try, axis=1, keepdims=True)
-                    qq = np.sum(q_try * q_try, axis=1, keepdims=True)
-                    sc_opt = np.where(qq > 0.0, wq / qq, 0.0)
-                    score = wq * sc_opt
-                    improve = score > best_score
-                    if np.any(improve):
-                        best_score = np.where(improve, score, best_score)
-                        best_sc = np.where(improve, sc_opt, best_sc)
-                        best_q = np.where(improve, q_try.astype(np.int8), best_q)
+                if imp_r32 is not None:
+                    w_rows = imp_r32 * rows32
+                    for alpha in np.linspace(0.55, 1.00, 15, dtype=np.float32):
+                        sc_try = (max_abs * alpha) / 7.5
+                        inv_try = np.where(sc_try == 0.0, 0.0, 1.0 / sc_try)
+                        q_try = np.clip(np.round(rows32 * inv_try), -8.0, 7.0)
+                        wq = np.sum(w_rows * q_try, axis=1, keepdims=True)
+                        qq = np.sum(imp_r32 * q_try * q_try, axis=1, keepdims=True)
+                        sc_opt = np.where(qq > 0.0, wq / qq, 0.0)
+                        score = wq * sc_opt
+                        improve = (score > best_score) & (sc_opt >= 0.0)
+                        if np.any(improve):
+                            best_score = np.where(improve, score, best_score)
+                            best_sc = np.where(improve, sc_opt, best_sc)
+                            best_q = np.where(improve, q_try.astype(np.int8), best_q)
+                    inv_ref = np.where(best_sc > 0.0, 1.0 / best_sc, 0.0)
+                    q_ref = np.clip(np.round(rows32 * inv_ref), -8.0, 7.0)
+                    wq_ref = np.sum(w_rows * q_ref, axis=1, keepdims=True)
+                    qq_ref = np.sum(imp_r32 * q_ref * q_ref, axis=1, keepdims=True)
+                    sc_ref = np.where(qq_ref > 0.0, wq_ref / qq_ref, 0.0)
+                    score_ref = wq_ref * sc_ref
+                    imp_ref = (score_ref > best_score) & (sc_ref >= 0.0)
+                    if np.any(imp_ref):
+                        best_sc = np.where(imp_ref, sc_ref, best_sc)
+                        best_q = np.where(imp_ref, q_ref.astype(np.int8), best_q)
+                else:
+                    for alpha in np.linspace(0.72, 1.00, 9, dtype=np.float32):
+                        sc_try = (max_abs * alpha) / 7.5
+                        inv_try = np.where(sc_try == 0.0, 0.0, 1.0 / sc_try)
+                        q_try = np.clip(np.round(rows32 * inv_try), -8.0, 7.0)
+                        wq = np.sum(rows32 * q_try, axis=1, keepdims=True)
+                        qq = np.sum(q_try * q_try, axis=1, keepdims=True)
+                        sc_opt = np.where(qq > 0.0, wq / qq, 0.0)
+                        score = wq * sc_opt
+                        improve = score > best_score
+                        if np.any(improve):
+                            best_score = np.where(improve, score, best_score)
+                            best_sc = np.where(improve, sc_opt, best_sc)
+                            best_q = np.where(improve, q_try.astype(np.int8), best_q)
 
             u = (best_q + 8).astype(np.uint8).reshape(-1, 2)
             packed = (u[:, 0] | (u[:, 1] << 4)).astype(np.uint8)
@@ -312,8 +576,12 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
                 sc = (max_abs / 127.0).astype(np.float32)
                 inv_sc = np.where(sc == 0.0, 0.0, 1.0 / sc)
                 q_f = np.clip(np.round(blk * inv_sc), -127.0, 127.0)
-                wq = np.sum(blk * q_f, axis=1, keepdims=True)
-                qq = np.sum(q_f * q_f, axis=1, keepdims=True)
+                if imp_512 is not None:
+                    wq = np.sum(imp_512 * blk * q_f, axis=1, keepdims=True)
+                    qq = np.sum(imp_512 * q_f * q_f, axis=1, keepdims=True)
+                else:
+                    wq = np.sum(blk * q_f, axis=1, keepdims=True)
+                    qq = np.sum(q_f * q_f, axis=1, keepdims=True)
                 sc_opt = np.where(qq > 0.0, wq / qq, sc).astype(np.float32)
             q = q_f.astype(np.int8)
             scales_list.append(sc_opt.reshape(-1).tobytes())
@@ -326,8 +594,12 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
                 sc = (max_abs / 127.0).astype(np.float32)
                 inv_sc = np.where(sc == 0.0, 0.0, 1.0 / sc)
                 q_f = np.clip(np.round(rows32 * inv_sc), -127.0, 127.0)
-                wq = np.sum(rows32 * q_f, axis=1, keepdims=True)
-                qq = np.sum(q_f * q_f, axis=1, keepdims=True)
+                if imp_r32 is not None:
+                    wq = np.sum(imp_r32 * rows32 * q_f, axis=1, keepdims=True)
+                    qq = np.sum(imp_r32 * q_f * q_f, axis=1, keepdims=True)
+                else:
+                    wq = np.sum(rows32 * q_f, axis=1, keepdims=True)
+                    qq = np.sum(q_f * q_f, axis=1, keepdims=True)
                 sc_opt = np.where(qq > 0.0, wq / qq, sc).astype(np.float16)
             q = q_f.astype(np.int8)
             scales_list.append(sc_opt.reshape(-1).tobytes())
@@ -337,7 +609,6 @@ def quantize_matrix_tiled(mat: np.ndarray, quant_type: int, per_tensor_scale: bo
             raise ValueError(f"Unsupported tiled quant_type: {quant_type}")
 
     return b"".join(scales_list), b"".join(data_list), rows, cols
-
 
 def build_layer_recipe(config: dict):
     """
@@ -894,6 +1165,513 @@ def load_hf_safetensors(repo_or_dir: str, max_seq_override: int = 0):
     return config, specs
 
 
+GGUF_MAGIC = b"GGUF"
+
+GGUF_VAL_UINT8   = 0
+GGUF_VAL_INT8    = 1
+GGUF_VAL_UINT16  = 2
+GGUF_VAL_INT16   = 3
+GGUF_VAL_UINT32  = 4
+GGUF_VAL_INT32   = 5
+GGUF_VAL_FLOAT32 = 6
+GGUF_VAL_BOOL    = 7
+GGUF_VAL_STRING  = 8
+GGUF_VAL_ARRAY   = 9
+GGUF_VAL_UINT64  = 10
+GGUF_VAL_INT64   = 11
+GGUF_VAL_FLOAT64 = 12
+
+_GGUF_SCALAR_FMTS = {
+    GGUF_VAL_UINT8:   ("<B", 1, np.uint8),
+    GGUF_VAL_INT8:    ("<b", 1, np.int8),
+    GGUF_VAL_UINT16:  ("<H", 2, np.uint16),
+    GGUF_VAL_INT16:   ("<h", 2, np.int16),
+    GGUF_VAL_UINT32:  ("<I", 4, np.uint32),
+    GGUF_VAL_INT32:   ("<i", 4, np.int32),
+    GGUF_VAL_FLOAT32: ("<f", 4, np.float32),
+    GGUF_VAL_BOOL:    ("<?", 1, np.bool_),
+    GGUF_VAL_UINT64:  ("<Q", 8, np.uint64),
+    GGUF_VAL_INT64:   ("<q", 8, np.int64),
+    GGUF_VAL_FLOAT64: ("<d", 8, np.float64),
+}
+
+GGML_TYPE_F32  = 0
+GGML_TYPE_F16  = 1
+GGML_TYPE_Q4_0 = 2
+GGML_TYPE_Q4_1 = 3
+GGML_TYPE_Q8_0 = 8
+GGML_TYPE_BF16 = 30
+
+_GGML_TYPE_SPEC = {
+    GGML_TYPE_F32:  ("F32",  1,  4),
+    GGML_TYPE_F16:  ("F16",  1,  2),
+    GGML_TYPE_BF16: ("BF16", 1,  2),
+    GGML_TYPE_Q4_0: ("Q4_0", 32, 18),
+    GGML_TYPE_Q4_1: ("Q4_1", 32, 20),
+    GGML_TYPE_Q8_0: ("Q8_0", 32, 34),
+}
+
+
+def _gguf_read_exact(fp, n: int) -> bytes:
+    data = fp.read(n)
+    if len(data) != n:
+        raise ValueError(f"Unexpected EOF in GGUF (wanted {n} bytes, got {len(data)})")
+    return data
+
+
+def _gguf_read_str(fp) -> str:
+    slen = struct.unpack("<Q", _gguf_read_exact(fp, 8))[0]
+    if slen > 64 * 1024 * 1024:
+        raise ValueError(f"Unreasonable GGUF string length: {slen}")
+    return _gguf_read_exact(fp, slen).decode("utf-8", errors="replace")
+
+
+def _gguf_read_value(fp, vtype: int):
+    if vtype == GGUF_VAL_STRING:
+        return _gguf_read_str(fp)
+    if vtype == GGUF_VAL_ARRAY:
+        etype, count = struct.unpack("<IQ", _gguf_read_exact(fp, 12))
+        if count > 4 * 1024 * 1024:
+            raise ValueError(f"Unreasonable GGUF array length: {count}")
+        if etype in _GGUF_SCALAR_FMTS:
+            _, sz, np_dt = _GGUF_SCALAR_FMTS[etype]
+            raw = _gguf_read_exact(fp, count * sz)
+            return np.frombuffer(raw, dtype=np_dt).copy()
+        if etype == GGUF_VAL_STRING:
+            return [_gguf_read_str(fp) for _ in range(count)]
+        return [_gguf_read_value(fp, etype) for _ in range(count)]
+    if vtype in _GGUF_SCALAR_FMTS:
+        fmt, sz, _ = _GGUF_SCALAR_FMTS[vtype]
+        return struct.unpack(fmt, _gguf_read_exact(fp, sz))[0]
+    raise ValueError(f"Unsupported GGUF metadata value type: {vtype}")
+
+
+def _ggml_dequantize(raw: bytes, ggml_type: int, shape: tuple) -> np.ndarray:
+    if ggml_type == GGML_TYPE_F32:
+        return np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
+    if ggml_type == GGML_TYPE_F16:
+        return np.frombuffer(raw, dtype=np.float16).astype(np.float32).reshape(shape)
+    if ggml_type == GGML_TYPE_BF16:
+        u32 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16
+        return u32.view(np.float32).reshape(shape)
+    if ggml_type == GGML_TYPE_Q8_0:
+        blk = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 34)
+        sc = np.ascontiguousarray(blk[:, :2]).view(np.float16).astype(np.float32)
+        qs = blk[:, 2:].view(np.int8).astype(np.float32)
+        return (qs * sc).reshape(shape)
+    if ggml_type == GGML_TYPE_Q4_0:
+        blk = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 18)
+        sc = np.ascontiguousarray(blk[:, :2]).view(np.float16).astype(np.float32)
+        qs = blk[:, 2:]
+        lo = (qs & 0x0F).astype(np.int32) - 8
+        hi = ((qs >> 4) & 0x0F).astype(np.int32) - 8
+        vals = np.concatenate((lo, hi), axis=1).astype(np.float32) * sc
+        return vals.reshape(shape)
+    if ggml_type == GGML_TYPE_Q4_1:
+        blk = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 20)
+        sc = np.ascontiguousarray(blk[:, :2]).view(np.float16).astype(np.float32)
+        mn = np.ascontiguousarray(blk[:, 2:4]).view(np.float16).astype(np.float32)
+        qs = blk[:, 4:]
+        lo = (qs & 0x0F).astype(np.float32)
+        hi = ((qs >> 4) & 0x0F).astype(np.float32)
+        vals = np.concatenate((lo, hi), axis=1) * sc + mn
+        return vals.reshape(shape)
+    raise ValueError(f"Unsupported GGML tensor type ID: {ggml_type}")
+
+
+class NativeGGUF:
+    def __init__(self, path: str):
+        self.path = path
+        self.meta = {}
+        self.tensors = {}
+        with open(path, "rb") as fp:
+            magic = _gguf_read_exact(fp, 4)
+            if magic != GGUF_MAGIC:
+                raise ValueError(f"Invalid GGUF magic {magic!r} in {path}")
+            version, tensor_count, kv_count = struct.unpack("<IQQ", _gguf_read_exact(fp, 20))
+            if version not in (2, 3):
+                raise ValueError(f"Unsupported GGUF version {version} in {path} (supported: v2, v3)")
+            self.version = version
+
+            for _ in range(kv_count):
+                k = _gguf_read_str(fp)
+                vtype = struct.unpack("<I", _gguf_read_exact(fp, 4))[0]
+                self.meta[k] = _gguf_read_value(fp, vtype)
+
+            for _ in range(tensor_count):
+                name = _gguf_read_str(fp)
+                n_dims = struct.unpack("<I", _gguf_read_exact(fp, 4))[0]
+                dims = struct.unpack(f"<{n_dims}Q", _gguf_read_exact(fp, 8 * n_dims))
+                ggml_type, offset = struct.unpack("<IQ", _gguf_read_exact(fp, 12))
+                shape_rm = tuple(int(d) for d in reversed(dims))
+                self.tensors[name] = {
+                    "dims": dims,
+                    "shape": shape_rm,
+                    "type": ggml_type,
+                    "offset": offset,
+                }
+
+            alignment = int(self.meta.get("general.alignment", 32) or 32)
+            self.data_base = align_up(fp.tell(), alignment)
+
+    def has_tensor(self, name: str) -> bool:
+        return name in self.tensors
+
+    def tensor_shape(self, name: str):
+        info = self.tensors.get(name)
+        return info["shape"] if info is not None else None
+
+    def get_tensor(self, name: str) -> np.ndarray:
+        info = self.tensors.get(name)
+        if info is None:
+            return None
+        ggml_type = info["type"]
+        if ggml_type not in _GGML_TYPE_SPEC:
+            raise ValueError(
+                f"Unsupported GGUF tensor type {ggml_type} for '{name}' "
+                f"(supported: F32=0, F16=1, Q4_0=2, Q4_1=3, Q8_0=8, BF16=30)"
+            )
+        _, blk_elems, blk_bytes = _GGML_TYPE_SPEC[ggml_type]
+        shape = info["shape"]
+        n_elems = 1
+        for d in shape:
+            n_elems *= d
+        if (n_elems % blk_elems) != 0:
+            raise ValueError(f"GGUF tensor '{name}' elements ({n_elems}) not divisible by block size {blk_elems}")
+        byte_size = (n_elems // blk_elems) * blk_bytes
+        with open(self.path, "rb") as fp:
+            fp.seek(self.data_base + info["offset"])
+            raw = _gguf_read_exact(fp, byte_size)
+        return _ggml_dequantize(raw, ggml_type, shape)
+
+
+def _parse_imatrix_gguf(path: str) -> dict:
+    g = NativeGGUF(path)
+    out = {}
+    for tname in g.tensors.keys():
+        if tname.endswith(".in_sum2"):
+            base = tname[:-8]
+            arr = g.get_tensor(tname).reshape(-1)
+            cnt_name = base + ".counts"
+            if g.has_tensor(cnt_name):
+                cnt = g.get_tensor(cnt_name).reshape(-1)
+                if cnt.size == arr.size:
+                    arr = np.where(cnt > 0.0, arr / cnt, 0.0).astype(np.float32)
+                elif cnt.size >= 1 and float(cnt[0]) > 0.0:
+                    arr = (arr / float(cnt[0])).astype(np.float32)
+            out[base] = arr
+    if not out:
+        for tname in g.tensors.keys():
+            if not tname.endswith(".counts"):
+                out[tname] = g.get_tensor(tname).reshape(-1)
+    return out
+
+
+def build_tokenizer_from_gguf(meta: dict, vocab_size: int) -> bytes:
+    tokens = meta.get("tokenizer.ggml.tokens")
+    if not tokens:
+        return None
+    tok_model = str(meta.get("tokenizer.ggml.model", "")).lower()
+    is_byte_level = (tok_model == "gpt2")
+    u2b = _gpt2_bytes_to_unicode() if is_byte_level else None
+    tok_types = meta.get("tokenizer.ggml.token_type")
+    if tok_types is not None:
+        tok_types = np.asarray(tok_types, dtype=np.int32).reshape(-1)
+
+    bos_id = int(meta.get("tokenizer.ggml.bos_token_id", -1))
+    eos_id = int(meta.get("tokenizer.ggml.eos_token_id", -1))
+    eot_id = int(meta.get("tokenizer.ggml.eot_token_id", -1))
+
+    str_to_id = {}
+    n_tok = len(tokens)
+    eff_vocab = max(vocab_size, n_tok)
+    for i, s in enumerate(tokens):
+        str_to_id[s] = i
+        if bos_id < 0 and s in ("<s>", "<|begin_of_text|>", "<bos>"):
+            bos_id = i
+        elif eos_id < 0 and s in ("</s>", "<|end_of_text|>", "<|endoftext|>", "<eos>"):
+            eos_id = i
+        elif eot_id < 0 and s in ("<|eot_id|>", "<|im_end|>", "<end_of_turn>", "<|end|>"):
+            eot_id = i
+    if eos_id < 0:
+        eos_id = eot_id if eot_id >= 0 else 2
+
+    def gguf_piece_to_bytes(piece_str: str, is_special: bool) -> bytes:
+        if piece_str == "":
+            return b""
+        if is_special or (piece_str.startswith("<|") and piece_str.endswith("|>")) or piece_str in (
+            "<s>", "</s>", "<unk>", "<pad>", "<bos>", "<eos>",
+            "<start_of_turn>", "<end_of_turn>", "<think>", "</think>",
+        ):
+            return piece_str.encode("utf-8")
+        if piece_str.startswith("<0x") and piece_str.endswith(">") and len(piece_str) == 6:
+            try:
+                return bytes([int(piece_str[3:5], 16)])
+            except ValueError:
+                return piece_str.encode("utf-8")
+        if is_byte_level and u2b is not None:
+            out_b = bytearray()
+            for ch in piece_str:
+                if ch in u2b:
+                    out_b.append(u2b[ch])
+                else:
+                    out_b.extend(ch.encode("utf-8"))
+            return bytes(out_b)
+        return piece_str.replace("▁", " ").replace("Ġ", " ").encode("utf-8")
+
+    vocab_pieces = []
+    bytes_to_id = {}
+    for i in range(eff_vocab):
+        raw_s = tokens[i] if i < n_tok else ""
+        is_sp = (tok_types is not None and i < tok_types.shape[0] and int(tok_types[i]) in (3, 4))
+        pb = gguf_piece_to_bytes(raw_s, is_sp)
+        vocab_pieces.append(pb)
+        if pb and not is_sp and pb not in bytes_to_id:
+            bytes_to_id[pb] = i
+
+    merges_tuples = []
+    seen_pairs = set()
+    raw_merges = meta.get("tokenizer.ggml.merges")
+    if raw_merges:
+        for rank, m in enumerate(raw_merges):
+            if not isinstance(m, str):
+                continue
+            parts = m.split(" ", 1)
+            if len(parts) != 2:
+                continue
+            p1, p2 = parts[0], parts[1]
+            id1 = str_to_id.get(p1)
+            id2 = str_to_id.get(p2)
+            idt = str_to_id.get(p1 + p2)
+            if id1 is not None and id2 is not None and idt is not None:
+                pk = (id1 << 32) | id2
+                if pk not in seen_pairs:
+                    seen_pairs.add(pk)
+                    merges_tuples.append((id1, id2, idt, rank))
+    else:
+        scores = meta.get("tokenizer.ggml.scores")
+        if scores is not None:
+            scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+            cands = []
+            for tid in range(min(n_tok, scores.shape[0])):
+                p_bytes = vocab_pieces[tid]
+                raw_s = tokens[tid]
+                is_sp = (tok_types is not None and tid < tok_types.shape[0] and int(tok_types[tid]) in (3, 4))
+                if is_sp or len(p_bytes) < 2 or raw_s.startswith("<0x"):
+                    continue
+                sc = float(scores[tid])
+                for split in range(1, len(p_bytes)):
+                    lid = bytes_to_id.get(p_bytes[:split])
+                    rid = bytes_to_id.get(p_bytes[split:])
+                    if lid is not None and rid is not None:
+                        cands.append((-sc, lid, rid, tid))
+            cands.sort(key=lambda x: x[0])
+            for rank, (_, lid, rid, tid) in enumerate(cands):
+                pk = (lid << 32) | rid
+                if pk not in seen_pairs:
+                    seen_pairs.add(pk)
+                    merges_tuples.append((lid, rid, tid, rank))
+
+    return serialize_qmx_tokenizer(vocab_pieces[:vocab_size], merges_tuples, bos_id, eos_id, eot_id, is_byte_level)
+
+
+def load_gguf(gguf_path: str, max_seq_override: int = 0):
+    g = NativeGGUF(gguf_path)
+    meta = g.meta
+    arch = str(meta.get("general.architecture", "llama")).lower()
+    is_bitnet = ("bitnet" in arch)
+    is_gemma = ("gemma" in arch)
+
+    def mget(suffix: str, default=None):
+        key = f"{arch}.{suffix}"
+        if key in meta:
+            return meta[key]
+        if f"llama.{suffix}" in meta:
+            return meta[f"llama.{suffix}"]
+        return default
+
+    emb_shape = g.tensor_shape("token_embd.weight")
+    if emb_shape is None or len(emb_shape) != 2:
+        raise RuntimeError(f"GGUF '{gguf_path}' is missing 2D tensor 'token_embd.weight'")
+
+    vocab_size = int(emb_shape[0])
+    dim = int(mget("embedding_length", emb_shape[1]))
+    hidden_dim = int(mget("feed_forward_length", 0))
+    n_layers = int(mget("block_count", 0))
+    n_heads = int(mget("attention.head_count", 0))
+    n_kv_heads = int(mget("attention.head_count_kv", n_heads))
+    head_dim = int(mget("attention.key_length", dim // n_heads if n_heads > 0 else 0))
+    rotary_dim = int(mget("rope.dimension_count", head_dim))
+    if rotary_dim <= 0 or rotary_dim > head_dim:
+        rotary_dim = head_dim
+    q_dim = n_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+
+    if hidden_dim <= 0:
+        gs = g.tensor_shape("blk.0.ffn_gate.weight") or g.tensor_shape("blk.0.ffn_up.weight")
+        if gs is not None:
+            hidden_dim = int(gs[0])
+        else:
+            fgu = g.tensor_shape("blk.0.ffn_gate_up.weight")
+            if fgu is not None:
+                hidden_dim = int(fgu[0]) // 2
+
+    native_seq_len = int(mget("context_length", 4096))
+    seq_len = max_seq_override if max_seq_override > 0 else min(native_seq_len, 4096)
+
+    rms_eps = float(mget("attention.layer_norm_rms_epsilon", mget("attention.layer_norm_epsilon", 1e-5)))
+    rope_theta = float(mget("rope.freq_base", 10000.0))
+
+    rope_scale_type = QMX_ROPE_SCALE_NONE
+    rope_scale_factor = float(mget("rope.scaling.factor", 1.0) or 1.0)
+    llama3_rope_scale = False
+    rs_str = str(mget("rope.scaling.type", "")).lower()
+    if rs_str == "linear":
+        rope_scale_type = QMX_ROPE_SCALE_LINEAR
+    elif rs_str == "yarn":
+        rope_scale_type = QMX_ROPE_SCALE_YARN
+    elif rs_str == "llama3":
+        rope_scale_type = QMX_ROPE_SCALE_LLAMA3
+        llama3_rope_scale = True
+
+    if is_bitnet:
+        activation = "relu2"
+    elif is_gemma:
+        activation = "geglu"
+    else:
+        activation = "swiglu"
+
+    neox_archs = (
+        "qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3",
+        "gptneox", "stablelm", "starcoder2", "falcon", "olmo2", "smollm3",
+    )
+    rope_split_half = (arch in neox_archs)
+
+    fused_qkv = (not g.has_tensor("blk.0.attn_q.weight")) and g.has_tensor("blk.0.attn_qkv.weight")
+    fused_gate_up = (not g.has_tensor("blk.0.ffn_gate.weight")) and g.has_tensor("blk.0.ffn_gate_up.weight")
+
+    has_qkv_bias = g.has_tensor("blk.0.attn_q.bias")
+    has_o_bias = g.has_tensor("blk.0.attn_output.bias")
+    has_qk_norm = g.has_tensor("blk.0.attn_q_norm.weight") and g.has_tensor("blk.0.attn_k_norm.weight")
+    has_norm_bias = g.has_tensor("blk.0.attn_norm.bias")
+    has_final_bias = g.has_tensor("output_norm.bias")
+    use_layernorm = has_norm_bias or ("gpt" in arch)
+    has_post_norm = g.has_tensor("blk.0.post_attention_norm.weight") and g.has_tensor("blk.0.post_ffw_norm.weight")
+    has_subnorm_weights = g.has_tensor("blk.0.attn_sub_norm.weight") and g.has_tensor("blk.0.ffn_sub_norm.weight")
+    if has_subnorm_weights:
+        is_bitnet = True
+
+    logit_softcap = float(mget("final_logit_softcapping", 0.0) or 0.0)
+    attn_softcap = float(mget("attn_logit_softcapping", 0.0) or 0.0)
+    emb_scale = math.sqrt(float(dim)) if is_gemma else 1.0
+    sliding_window = int(mget("attention.sliding_window", 0) or 0) if not is_gemma else 0
+
+    shared_classifier = not g.has_tensor("output.weight")
+    tok_bytes = build_tokenizer_from_gguf(meta, vocab_size)
+
+    def make_slice(key: str, r0: int, r1: int):
+        def _load():
+            arr = g.get_tensor(key)
+            return np.ascontiguousarray(arr[r0:r1, :])
+        return _load
+
+    specs = [
+        ("token_emb.weight", TID_TOKEN_EMB, 0xFFFF, True, QMX_PIN_LATENCY_SENS, lambda: g.get_tensor("token_embd.weight")),
+        ("rms_final.weight", TID_RMS_FINAL, 0xFFFF, False, QMX_PIN_CRITICAL, lambda: g.get_tensor("output_norm.weight")),
+    ]
+    if has_final_bias:
+        specs.append(("rms_final.bias", TID_RMS_FINAL_BIAS, 0xFFFF, False, QMX_PIN_CRITICAL, lambda: g.get_tensor("output_norm.bias")))
+    if not shared_classifier:
+        specs.append(("lm_head.weight", TID_LM_HEAD, 0xFFFF, True, QMX_PIN_STREAM_ONLY, lambda: g.get_tensor("output.weight")))
+
+    for l in range(n_layers):
+        bp = f"blk.{l}."
+        specs.append((f"blk.{l}.attn_norm", TID_ATTN_NORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_norm.weight": g.get_tensor(k)))
+        if has_norm_bias:
+            specs.append((f"blk.{l}.attn_norm_bias", TID_ATTN_NORM_BIAS, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_norm.bias": g.get_tensor(k)))
+
+        if fused_qkv:
+            qk = f"{bp}attn_qkv.weight"
+            specs.append((f"blk.{l}.attn_q", TID_ATTN_Q, l, True, QMX_PIN_LATENCY_SENS, make_slice(qk, 0, q_dim)))
+            specs.append((f"blk.{l}.attn_k", TID_ATTN_K, l, True, QMX_PIN_LATENCY_SENS, make_slice(qk, q_dim, q_dim + kv_dim)))
+            specs.append((f"blk.{l}.attn_v", TID_ATTN_V, l, True, QMX_PIN_LATENCY_SENS, make_slice(qk, q_dim + kv_dim, q_dim + 2 * kv_dim)))
+        else:
+            specs.append((f"blk.{l}.attn_q", TID_ATTN_Q, l, True, QMX_PIN_LATENCY_SENS, lambda k=f"{bp}attn_q.weight": g.get_tensor(k)))
+            if has_qkv_bias:
+                specs.append((f"blk.{l}.attn_q_bias", TID_ATTN_Q_BIAS, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_q.bias": g.get_tensor(k)))
+            specs.append((f"blk.{l}.attn_k", TID_ATTN_K, l, True, QMX_PIN_LATENCY_SENS, lambda k=f"{bp}attn_k.weight": g.get_tensor(k)))
+            if has_qkv_bias:
+                specs.append((f"blk.{l}.attn_k_bias", TID_ATTN_K_BIAS, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_k.bias": g.get_tensor(k)))
+            specs.append((f"blk.{l}.attn_v", TID_ATTN_V, l, True, QMX_PIN_LATENCY_SENS, lambda k=f"{bp}attn_v.weight": g.get_tensor(k)))
+            if has_qkv_bias:
+                specs.append((f"blk.{l}.attn_v_bias", TID_ATTN_V_BIAS, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_v.bias": g.get_tensor(k)))
+
+        if has_qk_norm:
+            specs.append((f"blk.{l}.attn_q_norm", TID_ATTN_Q_NORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_q_norm.weight": g.get_tensor(k)))
+            specs.append((f"blk.{l}.attn_k_norm", TID_ATTN_K_NORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_k_norm.weight": g.get_tensor(k)))
+        if has_subnorm_weights:
+            specs.append((f"blk.{l}.attn_subnorm", TID_ATTN_SUBNORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_sub_norm.weight": g.get_tensor(k)))
+
+        specs.append((f"blk.{l}.attn_wo", TID_ATTN_WO, l, True, QMX_PIN_LATENCY_SENS, lambda k=f"{bp}attn_output.weight": g.get_tensor(k)))
+        if has_o_bias:
+            specs.append((f"blk.{l}.attn_o_bias", TID_ATTN_O_BIAS, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}attn_output.bias": g.get_tensor(k)))
+        if has_post_norm:
+            specs.append((f"blk.{l}.attn_post_norm", TID_ATTN_POST_NORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}post_attention_norm.weight": g.get_tensor(k)))
+
+        specs.append((f"blk.{l}.ffn_norm", TID_FFN_NORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}ffn_norm.weight": g.get_tensor(k)))
+        if has_norm_bias:
+            specs.append((f"blk.{l}.ffn_norm_bias", TID_FFN_NORM_BIAS, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}ffn_norm.bias": g.get_tensor(k)))
+
+        if fused_gate_up:
+            gk = f"{bp}ffn_gate_up.weight"
+            specs.append((f"blk.{l}.ffn_gate", TID_FFN_GATE, l, True, QMX_PIN_STREAM_ONLY, make_slice(gk, 0, hidden_dim)))
+            specs.append((f"blk.{l}.ffn_up", TID_FFN_UP, l, True, QMX_PIN_STREAM_ONLY, make_slice(gk, hidden_dim, 2 * hidden_dim)))
+        else:
+            specs.append((f"blk.{l}.ffn_gate", TID_FFN_GATE, l, True, QMX_PIN_STREAM_ONLY, lambda k=f"{bp}ffn_gate.weight": g.get_tensor(k)))
+            specs.append((f"blk.{l}.ffn_up", TID_FFN_UP, l, True, QMX_PIN_STREAM_ONLY, lambda k=f"{bp}ffn_up.weight": g.get_tensor(k)))
+
+        if has_subnorm_weights:
+            specs.append((f"blk.{l}.ffn_subnorm", TID_FFN_SUBNORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}ffn_sub_norm.weight": g.get_tensor(k)))
+        specs.append((f"blk.{l}.ffn_down", TID_FFN_DOWN, l, True, QMX_PIN_STREAM_ONLY, lambda k=f"{bp}ffn_down.weight": g.get_tensor(k)))
+        if has_post_norm:
+            specs.append((f"blk.{l}.ffn_post_norm", TID_FFN_POST_NORM, l, False, QMX_PIN_CRITICAL, lambda k=f"{bp}post_ffw_norm.weight": g.get_tensor(k)))
+
+    config = {
+        "vocab_size": vocab_size,
+        "max_seq_len": seq_len,
+        "hidden_dim": dim,
+        "intermediate_dim": hidden_dim,
+        "num_layers": n_layers,
+        "num_heads": n_heads,
+        "num_kv_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "rotary_dim": rotary_dim,
+        "rms_norm_eps": rms_eps,
+        "rope_theta": rope_theta,
+        "rope_scale_type": rope_scale_type,
+        "rope_scale_factor": rope_scale_factor,
+        "emb_scale": emb_scale,
+        "logit_softcap": logit_softcap,
+        "attn_softcap": attn_softcap,
+        "sliding_window": sliding_window,
+        "shared_classifier": shared_classifier,
+        "rope_split_half": rope_split_half,
+        "llama3_rope_scale": llama3_rope_scale,
+        "has_qkv_bias": has_qkv_bias,
+        "has_o_bias": has_o_bias,
+        "has_qk_norm": has_qk_norm,
+        "has_norm_bias": has_norm_bias,
+        "has_post_norm": has_post_norm,
+        "use_layernorm": use_layernorm,
+        "has_subnorm": is_bitnet,
+        "has_subnorm_weights": has_subnorm_weights,
+        "activation": activation,
+        "is_bitnet": is_bitnet,
+        "tokenizer_bytes": tok_bytes,
+    }
+    return config, specs
+
+
 def load_karpathy_bin(bin_path: str, tok_path: str = None):
     with open(bin_path, "rb") as f:
         dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len = struct.unpack("<7i", f.read(28))
@@ -1046,7 +1824,8 @@ def estimate_min_ram(config: dict, critical_bytes: int) -> int:
 
 
 def export_qmx(output_path: str, config: dict, tensor_specs, primary_quant: int,
-               hybrid_emb_q8: bool, compact_align: bool = None, lm_head_quant: int = None):
+               hybrid_emb_q8: bool, compact_align: bool = None, lm_head_quant: int = None,
+               imatrix_map: dict = None):
     if not isinstance(tensor_specs, (list, tuple)):
         tensor_specs = list(tensor_specs)
     expected_count = len(tensor_specs)
@@ -1083,8 +1862,10 @@ def export_qmx(output_path: str, config: dict, tensor_specs, primary_quant: int,
     tensor_dir = bytearray()
     tensor_count = 0
     critical_bytes = 0
+    imatrix_hits = 0
+    matrix_2d_count = 0
 
-    with open(output_path, "wb") as f:
+    with open(output_path, "w+b") as f:
         # 1. Placeholder header (128 bytes)
         f.write(b"\x00" * 128)
 
@@ -1131,7 +1912,11 @@ def export_qmx(output_path: str, config: dict, tensor_specs, primary_quant: int,
                     use_qtype = emb_qtype if hybrid_emb_q8 else primary_quant
                 else:
                     use_qtype = primary_quant
-                scales_b, data_b, _, _ = quantize_matrix_tiled(arr, use_qtype, per_tensor_scale)
+                matrix_2d_count += 1
+                imp_vec = resolve_imatrix_vector(imatrix_map, name, orig_cols)
+                if imp_vec is not None:
+                    imatrix_hits += 1
+                scales_b, data_b, _, _ = quantize_matrix_tiled(arr, use_qtype, per_tensor_scale, importance=imp_vec)
 
                 scales_off = cur_abs - payload_offset
                 f.write(scales_b)
@@ -1201,18 +1986,31 @@ def export_qmx(output_path: str, config: dict, tensor_specs, primary_quant: int,
         rope_scale_factor = float(config.get("rope_scale_factor", 1.0))
         sliding_window = int(config.get("sliding_window", 0))
 
+        f.seek(tensor_dir_offset)
+        f.write(tensor_dir)
+        f.flush()
+        f.seek(128)
+        file_crc = 0
+        rem_crc = file_end - 128
+        while rem_crc > 0:
+            blk = f.read(min(rem_crc, 4 * 1024 * 1024))
+            if not blk:
+                break
+            file_crc = zlib.crc32(blk, file_crc) & 0xFFFFFFFF
+            rem_crc -= len(blk)
+
         hdr_zero_crc = struct.pack(
             HEADER_FMT,
             QMX_MAGIC,
             QMX_VERSION_1_1,
             flags,
             0,
-            0,
+            file_crc,
             recipe_offset,
             recipe_count,
             tensor_dir_offset,
             tensor_count,
-            tokenizer_offset,
+            tokenizer_offset & 0xFFFFFFFF,
             tokenizer_size,
             payload_offset & 0xFFFFFFFF,
             payload_size & 0xFFFFFFFF,
@@ -1238,18 +2036,19 @@ def export_qmx(output_path: str, config: dict, tensor_specs, primary_quant: int,
             rope_scale_type,
             1 if config.get("use_layernorm", False) else 0,
             sliding_window,
-            b"\x00" * 12,
+            (tokenizer_offset >> 32) & 0xFFFFFFFF,
+            b"\x00" * 8,
         )
         hdr_crc = zlib.crc32(hdr_zero_crc) & 0xFFFFFFFF
         hdr_final = hdr_zero_crc[:8] + struct.pack("<I", hdr_crc) + hdr_zero_crc[12:]
 
-        f.seek(tensor_dir_offset)
-        f.write(tensor_dir)
         f.seek(0)
         f.write(hdr_final)
 
     size_mb = file_end / (1024.0 * 1024.0)
     size_str = f"{size_mb:.2f} MB" if size_mb >= 1.0 else f"{file_end / 1024.0:.1f} KB"
+    if imatrix_map:
+        print(f"[iMatrix] Applied calibration weights to {imatrix_hits}/{matrix_2d_count} 2D tensors (entries={len(imatrix_map)})")
     print(
         f"[OK] Packed {output_path} ({size_str}) | v1.1 | "
         f"quant={QUANT_NAMES[primary_quant]} | layers={config['num_layers']} | "
@@ -1268,7 +2067,7 @@ def inspect_qmx(path: str):
 
         unpacked = struct.unpack(HEADER_FMT, hdr)
         (
-            magic, version, flags, stored_crc, _file_crc,
+            magic, version, flags, stored_crc, stored_file_crc,
             recipe_off, recipe_cnt, tdir_off, t_cnt,
             tok_off, tok_sz, pay_off_lo, pay_sz_lo,
             vocab_sz, max_seq, dim, inter_dim,
@@ -1276,13 +2075,14 @@ def inspect_qmx(path: str):
             rms_eps, rope_theta, min_ram,
             pay_off_hi, pay_sz_hi, head_dim, rotary_dim,
             emb_scale, logit_softcap, attn_softcap, rope_scale_factor,
-            rope_scale_type, _norm_type, sliding_window, _res
+            rope_scale_type, _norm_type, sliding_window, tok_off_hi, _res
         ) = unpacked
 
         if magic != QMX_MAGIC:
             sys.exit(f"Error: invalid QMX magic 0x{magic:08X}")
 
         is_v11 = version >= QMX_VERSION_1_1
+        tok_off_64 = ((tok_off_hi << 32) | tok_off) if is_v11 else tok_off
         pay_off = ((pay_off_hi << 32) | pay_off_lo) if is_v11 else pay_off_lo
         pay_sz = ((pay_sz_hi << 32) | pay_sz_lo) if is_v11 else pay_sz_lo
         eff_head_dim = head_dim if (is_v11 and head_dim > 0) else (dim // n_heads)
@@ -1296,6 +2096,28 @@ def inspect_qmx(path: str):
         print(f"  File Size      : {fsize / 1024.0:.1f} KB ({fsize} bytes)")
         print(f"  Format Version : v{version >> 8}.{version & 0xFF}")
         print(f"  Header CRC32   : {crc_str}")
+        if stored_file_crc == 0:
+            print("  File CRC32     : 0x00000000 (None / Legacy)")
+        else:
+            cart_end = max(
+                128,
+                recipe_off + recipe_cnt * 8,
+                tdir_off + t_cnt * 64,
+                (tok_off_64 + tok_sz) if tok_sz else 0,
+                pay_off + pay_sz,
+            )
+            f.seek(128)
+            calc_fcrc = 0
+            rem_fc = max(0, min(cart_end, fsize) - 128)
+            while rem_fc > 0:
+                blk = f.read(min(rem_fc, 4 * 1024 * 1024))
+                if not blk:
+                    break
+                calc_fcrc = zlib.crc32(blk, calc_fcrc) & 0xFFFFFFFF
+                rem_fc -= len(blk)
+            fcrc_ok = (cart_end <= fsize) and (calc_fcrc == stored_file_crc)
+            fcrc_str = f"0x{stored_file_crc:08X} ({'VALID' if fcrc_ok else f'MISMATCH expected 0x{calc_fcrc:08X}'})"
+            print(f"  File CRC32     : {fcrc_str}")
         print(f"  Primary Quant  : 0x{p_quant:02X} ({QUANT_NAMES.get(p_quant, 'Unknown')})")
         print(f"  Topology       : dim={dim}, inter={inter_dim}, layers={n_layers}, heads={n_heads}/{n_kv_heads}, head_dim={eff_head_dim}, rot_dim={eff_rot_dim}")
         print(f"  Vocab / Ctx    : vocab={vocab_sz}, max_seq={max_seq}, swa={sliding_window}")
@@ -1304,7 +2126,7 @@ def inspect_qmx(path: str):
             print(f"  Scaling / Cap  : emb_scale={emb_scale:.4f}, logit_cap={logit_softcap:.1f}, attn_cap={attn_softcap:.1f}")
         print(f"  Min Stream RAM : {min_ram / 1024.0:.1f} KB")
         print(f"  Flags          : 0x{flags:04X}")
-        print(f"  Tokenizer      : {'Embedded (' + str(tok_sz) + ' B @ 0x' + hex(tok_off)[2:] + ')' if tok_sz else 'None'}")
+        print(f"  Tokenizer      : {'Embedded (' + str(tok_sz) + ' B @ 0x' + hex(tok_off_64)[2:] + ')' if tok_sz else 'None'}")
         print(f"  Payload Offset : 0x{pay_off:08X} ({pay_sz / 1024.0:.1f} KB, page_aligned={pay_off % 4096 == 0})")
 
         f.seek(recipe_off)
@@ -1324,9 +2146,10 @@ def inspect_qmx(path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="QMX Forge v1.2b: Package & Inspect .qmx v1.1 Cartridges")
+    parser = argparse.ArgumentParser(description="QMX Forge v1.3c-alpha: Package & Inspect .qmx v1.1 Cartridges")
     parser.add_argument("--info", type=str, help="Inspect an existing .qmx cartridge")
     parser.add_argument("--hf", type=str, help="HuggingFace repo ID or local model directory")
+    parser.add_argument("--gguf", type=str, help="Direct import from GGUF v2/v3 file (F32/F16/BF16/Q8_0/Q4_0/Q4_1)")
     parser.add_argument("--input", "-i", type=str, help="Karpathy llama2.c .bin checkpoint")
     parser.add_argument("--tokenizer", "-z", type=str, help="External tokenizer.bin (for Karpathy .bin)")
     parser.add_argument("--dummy", action="store_true", help="Generate synthetic micro-model for testing")
@@ -1337,6 +2160,7 @@ def main():
     parser.add_argument("--no-compact", action="store_true", help="Force 512B/4096B page alignment (best for mmap)")
     parser.add_argument("--no-hybrid-emb", action="store_true", help="Quantize embeddings and lm_head with primary quant instead of Q8")
     parser.add_argument("--lm-head-quant", choices=["auto", "binary", "ternary", "q4", "q8", "q4_r32", "q8_r32"], default="auto", help="Override quantization profile for lm_head (and tied token_emb)")
+    parser.add_argument("--imatrix", type=str, help="Calibration importance matrix (.json, .dat, .npz, or .txt)")
     args = parser.parse_args()
 
     if args.info:
@@ -1366,14 +2190,18 @@ def main():
     elif args.hf:
         cfg, t_specs = load_hf_safetensors(args.hf, args.max_seq)
         hybrid = not args.no_hybrid_emb
+    elif args.gguf:
+        cfg, t_specs = load_gguf(args.gguf, args.max_seq)
+        hybrid = not args.no_hybrid_emb
     elif args.input:
         cfg, t_specs = load_karpathy_bin(args.input, args.tokenizer)
         hybrid = not args.no_hybrid_emb
     else:
-        sys.exit("Error: specify --hf <repo_or_dir>, --input <file.bin>, --dummy, or --info <file.qmx>")
+        sys.exit("Error: specify --hf <repo_or_dir>, --gguf <model.gguf>, --input <file.bin>, --dummy, or --info <file.qmx>")
 
+    imatrix_map = load_imatrix(args.imatrix) if args.imatrix else None
     lm_q = None if args.lm_head_quant == "auto" else q_map[args.lm_head_quant]
-    export_qmx(args.output, cfg, t_specs, p_quant, hybrid, compact_align=compact, lm_head_quant=lm_q)
+    export_qmx(args.output, cfg, t_specs, p_quant, hybrid, compact_align=compact, lm_head_quant=lm_q, imatrix_map=imatrix_map)
 
 
 if __name__ == "__main__":

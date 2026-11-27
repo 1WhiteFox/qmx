@@ -30,7 +30,7 @@ extern "C" {
 #define QMX_VERSION_1_0         0x0100u
 #define QMX_VERSION_1_1         0x0101u
 #define QMX_VERSION             QMX_VERSION_1_1
-#define QMX_RUNTIME_VERSION_STR "v1.2b"
+#define QMX_RUNTIME_VERSION_STR "1.3c-alpha"
 
 #define QMX_CACHE_ALIGN         64u
 #define QMX_SECTOR_ALIGN        512u
@@ -213,8 +213,8 @@ typedef struct {
     int         is_mmap;
     int         is_xip;
     uint32_t    tensor_count;
-    uint32_t    tokenizer_offset;
-    uint32_t    tokenizer_size;
+    uint64_t    tokenizer_offset;
+    uint64_t    tokenizer_size;
     int         num_threads;
 } QmxModelInfo;
 
@@ -304,7 +304,8 @@ typedef struct {
     uint8_t  rope_scale_type;
     uint8_t  norm_type;
     uint16_t sliding_window;
-    uint8_t  reserved[12];
+    uint32_t tokenizer_offset_hi;
+    uint8_t  reserved[8];
 } QmxHeader;
 
 typedef struct {
@@ -355,6 +356,7 @@ typedef char assert_qmx_header_128b[(sizeof(QmxHeader) == 128) ? 1 : -1];
 typedef char assert_qmx_hdr_rope_off[(offsetof(QmxHeader, rope_scale_type) == 112) ? 1 : -1];
 typedef char assert_qmx_hdr_norm_off[(offsetof(QmxHeader, norm_type) == 113) ? 1 : -1];
 typedef char assert_qmx_hdr_swa_off[(offsetof(QmxHeader, sliding_window) == 114) ? 1 : -1];
+typedef char assert_qmx_hdr_tok_hi_off[(offsetof(QmxHeader, tokenizer_offset_hi) == 116) ? 1 : -1];
 typedef char assert_qmx_desc_64b[(sizeof(QmxTensorDesc) == 64) ? 1 : -1];
 typedef char assert_qmx_inst_8b[(sizeof(QmxInstruction) == 8) ? 1 : -1];
 typedef char assert_qmx_tok_hdr_32b[(sizeof(QmxTokenizerHeader) == 32) ? 1 : -1];

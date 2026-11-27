@@ -13,6 +13,7 @@ HEADERS = [
     "include/qmx_tokenizer.h",
     "include/qmx_sampler.h",
     "include/qmx_gen.h",
+    "include/qmx_plugin.h",
 ]
 
 SOURCES = [
@@ -34,6 +35,8 @@ SOURCES = [
     "src/kernels_mcu32.c",
     "src/kernels_cortex_m.c",
     "src/qmx_dispatch.c",
+    "src/qmx_autotune.c",
+    "src/qmx_plugin.c",
 ]
 
 LOCAL_INC_RE = re.compile(r'^\s*#include\s+"(?:\.\./include/)?qmx[^"]*\.h"\s*$')

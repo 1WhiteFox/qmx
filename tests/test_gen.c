@@ -200,8 +200,15 @@ int main(int argc, char **argv) {
     test_step_parity_and_chunks(path);
     test_multiturn_flush_and_window_shift(path);
 
+    {
+        int phys_cores = qmx_detect_physical_cores();
+        EXPECT(phys_cores >= 1 && phys_cores <= QMX_MAX_THREADS, "qmx_detect_physical_cores in valid range");
+        QmxBackend tuned = qmx_autotune_backend(1024u, 2048u);
+        EXPECT(tuned < QMX_BACKEND_COUNT, "qmx_autotune_backend returned valid backend");
+    }
+
     if (g_failures == 0) {
-        printf("[PASS] qmx_step, multi-turn flush, KV window pos & telemetry tests passed!\n");
+        printf("[PASS] qmx_step, multi-turn flush, KV window pos, telemetry & autotune tests passed!\n");
         return 0;
     }
     fprintf(stderr, "[FAIL] test_gen failures: %d\n", g_failures);

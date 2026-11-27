@@ -14,6 +14,14 @@
 #endif
 #include <immintrin.h>
 
+#ifndef QMX_MSVC_ZEROUPPER
+    #if defined(_MSC_VER)
+        #define QMX_MSVC_ZEROUPPER() _mm256_zeroupper()
+    #else
+        #define QMX_MSVC_ZEROUPPER() ((void)0)
+    #endif
+#endif
+
 QMX_AVX2_TARGET
 static void avx2_prepare_act(const float * QMX_RESTRICT x,
                              int8_t      * QMX_RESTRICT xq,
@@ -56,6 +64,7 @@ static void avx2_prepare_act(const float * QMX_RESTRICT x,
         _mm256_storeu_si256((__m256i *)(xq + (size_t)g * QMX_TILE_COLS), b32);
     }
 
+    QMX_MSVC_ZEROUPPER();
     uint32_t tail_base = full_groups * QMX_TILE_COLS;
     if (tail_base < cols) {
         qmx_quantize_activations_q8(x + tail_base, xq + tail_base, x_scales + full_groups, cols - tail_base);
@@ -185,9 +194,27 @@ static inline __m256i avx2_dot_bin_row(const uint8_t *tile_ptr, uint32_t lr, __m
 }
 
 QMX_AVX2_TARGET
-static void avx2_matmul_q4(float * QMX_RESTRICT out, const int8_t * QMX_RESTRICT xq,
-                           const float * QMX_RESTRICT x_scales, const QmxTensor *w,
-                           int accumulate, int is_row_scaled) {
+static void avx2_prepare_act_eo(const int8_t * QMX_RESTRICT xq,
+                                int8_t       * QMX_RESTRICT xq_eo,
+                                int32_t      * QMX_RESTRICT x_sums,
+                                uint32_t cols) {
+    uint32_t n_tc = (uint32_t)qmx_align_up(cols, QMX_TILE_COLS) / QMX_TILE_COLS;
+    __m128i shuf_eo = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+    for (uint32_t tc = 0; tc < n_tc; tc++) {
+        __m128i xe, xo;
+        int32_t xs = 0;
+        avx2_split_x32_eo(xq + (size_t)tc * QMX_TILE_COLS, shuf_eo, &xe, &xo, &xs);
+        _mm_storeu_si128((__m128i *)(xq_eo + (size_t)tc * QMX_TILE_COLS + 0u), xe);
+        _mm_storeu_si128((__m128i *)(xq_eo + (size_t)tc * QMX_TILE_COLS + 16u), xo);
+        x_sums[tc] = xs;
+    }
+}
+
+QMX_AVX2_TARGET
+QMX_INLINE void avx2_matmul_q4(float * QMX_RESTRICT out, const int8_t * QMX_RESTRICT xq,
+                               const int8_t * QMX_RESTRICT xq_eo, const int32_t * QMX_RESTRICT x_sums,
+                               const float * QMX_RESTRICT x_scales, const QmxTensor *w,
+                               int accumulate, int is_row_scaled, int use_eo) {
     uint32_t orig_rows = w->rows;
     uint32_t n_tr = (uint32_t)qmx_align_up(orig_rows, QMX_TILE_ROWS) / QMX_TILE_ROWS;
     uint32_t n_tc = (uint32_t)qmx_align_up(w->cols, QMX_TILE_COLS) / QMX_TILE_COLS;
@@ -196,16 +223,7 @@ static void avx2_matmul_q4(float * QMX_RESTRICT out, const int8_t * QMX_RESTRICT
     __m256i ones16 = _mm256_set1_epi16(1);
     __m256i mask0f = _mm256_set1_epi8(0x0F);
     __m128i shuf_eo = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
-
-    __m128i pre_xe[512];
-    __m128i pre_xo[512];
-    int32_t pre_bias[512];
-    uint32_t pre_cap = (n_tc <= 512u) ? n_tc : 512u;
-    for (uint32_t tc = 0; tc < pre_cap; tc++) {
-        int32_t xs = 0;
-        avx2_split_x32_eo(xq + (size_t)tc * QMX_TILE_COLS, shuf_eo, &pre_xe[tc], &pre_xo[tc], &xs);
-        pre_bias[tc] = xs << 3;
-    }
+    (void)xq; (void)xq_eo; (void)x_sums; (void)shuf_eo;
 
     uint32_t tr = 0;
     for (; tr + 1u < n_tr && (tr + 2u) * QMX_TILE_ROWS <= orig_rows; tr += 2u) {
@@ -226,14 +244,14 @@ static void avx2_matmul_q4(float * QMX_RESTRICT out, const int8_t * QMX_RESTRICT
         for (uint32_t tc = 0; tc < n_tc; tc++) {
             __m128i xe128, xo128;
             int32_t bias_i32;
-            if (tc < pre_cap) {
-                xe128 = pre_xe[tc];
-                xo128 = pre_xo[tc];
-                bias_i32 = pre_bias[tc];
+            if (use_eo) {
+                xe128 = _mm_loadu_si128((const __m128i *)(xq_eo + (size_t)tc * QMX_TILE_COLS + 0u));
+                xo128 = _mm_loadu_si128((const __m128i *)(xq_eo + (size_t)tc * QMX_TILE_COLS + 16u));
+                bias_i32 = x_sums[tc] * 8;
             } else {
                 int32_t xs = 0;
                 avx2_split_x32_eo(xq + (size_t)tc * QMX_TILE_COLS, shuf_eo, &xe128, &xo128, &xs);
-                bias_i32 = xs << 3;
+                bias_i32 = xs * 8;
             }
             __m256i vxe = _mm256_broadcastsi128_si256(xe128);
             __m256i vxo = _mm256_broadcastsi128_si256(xo128);
@@ -318,7 +336,7 @@ static void avx2_matmul_q4(float * QMX_RESTRICT out, const int8_t * QMX_RESTRICT
         _mm_storeu_ps(out + r_base1 + 12u, vb3);
     }
 
-    float tile_acc[QMX_TILE_ROWS] QMX_ALIGNED(32);
+    QMX_ALIGNED(32) float tile_acc[QMX_TILE_ROWS];
     for (; tr < n_tr; tr++) {
         uint32_t r_base = tr * QMX_TILE_ROWS;
         uint32_t rem_rows = (r_base < orig_rows) ? (orig_rows - r_base) : 0u;
@@ -340,14 +358,14 @@ static void avx2_matmul_q4(float * QMX_RESTRICT out, const int8_t * QMX_RESTRICT
 
             __m128i xe128, xo128;
             int32_t bias_i32;
-            if (tc < pre_cap) {
-                xe128 = pre_xe[tc];
-                xo128 = pre_xo[tc];
-                bias_i32 = pre_bias[tc];
+            if (use_eo) {
+                xe128 = _mm_loadu_si128((const __m128i *)(xq_eo + (size_t)tc * QMX_TILE_COLS + 0u));
+                xo128 = _mm_loadu_si128((const __m128i *)(xq_eo + (size_t)tc * QMX_TILE_COLS + 16u));
+                bias_i32 = x_sums[tc] * 8;
             } else {
                 int32_t xs = 0;
                 avx2_split_x32_eo(xq + (size_t)tc * QMX_TILE_COLS, shuf_eo, &xe128, &xo128, &xs);
-                bias_i32 = xs << 3;
+                bias_i32 = xs * 8;
             }
             __m256i vxe = _mm256_broadcastsi128_si256(xe128);
             __m256i vxo = _mm256_broadcastsi128_si256(xo128);
@@ -397,7 +415,7 @@ static void avx2_matmul_q8(float * QMX_RESTRICT out, const int8_t * QMX_RESTRICT
     const uint8_t *base_data = (const uint8_t *)w->data;
     const uint16_t *scales_f16 = (const uint16_t *)(const void *)w->scales;
     __m256i ones16 = _mm256_set1_epi16(1);
-    float tile_acc[QMX_TILE_ROWS] QMX_ALIGNED(32);
+    QMX_ALIGNED(32) float tile_acc[QMX_TILE_ROWS];
 
     for (uint32_t tr = 0; tr < n_tr; tr++) {
         uint32_t r_base = tr * QMX_TILE_ROWS;
@@ -491,7 +509,7 @@ static void avx2_matmul_lowbit(float * QMX_RESTRICT out, const int8_t * QMX_REST
     __m256i bin_bits = _mm256_set1_epi64x((long long)0x8040201008040201ULL);
     __m256i two_u8 = _mm256_set1_epi8(2);
     __m256i one_u8 = _mm256_set1_epi8(1);
-    float tile_acc[QMX_TILE_ROWS] QMX_ALIGNED(32);
+    QMX_ALIGNED(32) float tile_acc[QMX_TILE_ROWS];
 
     for (uint32_t tr = 0; tr < n_tr; tr++) {
         uint32_t r_base = tr * QMX_TILE_ROWS;
@@ -590,9 +608,9 @@ static void avx2_matmul_tiled(float         * QMX_RESTRICT out,
     (void)xq16;
     uint8_t qt = w->quant_type;
     if (qt == QMX_QUANT_Q4_SYM) {
-        avx2_matmul_q4(out, xq, x_scales, w, accumulate, 0);
+        avx2_matmul_q4(out, xq, NULL, NULL, x_scales, w, accumulate, 0, 0);
     } else if (qt == QMX_QUANT_Q4_ROW32) {
-        avx2_matmul_q4(out, xq, x_scales, w, accumulate, 1);
+        avx2_matmul_q4(out, xq, NULL, NULL, x_scales, w, accumulate, 1, 0);
     } else if (qt == QMX_QUANT_Q8_SYM) {
         avx2_matmul_q8(out, xq, x_scales, w, accumulate, 0);
     } else if (qt == QMX_QUANT_Q8_ROW32) {
@@ -600,6 +618,300 @@ static void avx2_matmul_tiled(float         * QMX_RESTRICT out,
     } else {
         avx2_matmul_lowbit(out, xq, x_scales, w, accumulate, qt);
     }
+    QMX_MSVC_ZEROUPPER();
+}
+
+QMX_AVX2_TARGET
+static void avx2_matmul_tiled_eo(float         * QMX_RESTRICT out,
+                                 const int8_t  * QMX_RESTRICT xq,
+                                 const int8_t  * QMX_RESTRICT xq_eo,
+                                 const int32_t * QMX_RESTRICT x_sums,
+                                 const float   * QMX_RESTRICT x_scales,
+                                 const QmxTensor *w,
+                                 int accumulate) {
+    if (!xq_eo || !x_sums) {
+        avx2_matmul_tiled(out, xq, NULL, x_scales, w, accumulate);
+        return;
+    }
+    uint8_t qt = w->quant_type;
+    if (qt == QMX_QUANT_Q4_SYM) {
+        avx2_matmul_q4(out, xq, xq_eo, x_sums, x_scales, w, accumulate, 0, 1);
+    } else if (qt == QMX_QUANT_Q4_ROW32) {
+        avx2_matmul_q4(out, xq, xq_eo, x_sums, x_scales, w, accumulate, 1, 1);
+    } else if (qt == QMX_QUANT_Q8_SYM) {
+        avx2_matmul_q8(out, xq, x_scales, w, accumulate, 0);
+    } else if (qt == QMX_QUANT_Q8_ROW32) {
+        avx2_matmul_q8(out, xq, x_scales, w, accumulate, 1);
+    } else {
+        avx2_matmul_lowbit(out, xq, x_scales, w, accumulate, qt);
+    }
+    QMX_MSVC_ZEROUPPER();
+}
+
+QMX_AVX2_TARGET
+static inline __m256i avx2_reduce2x4_epi32(__m256i d0, __m256i d1, __m256i d2, __m256i d3) {
+    __m256i t0  = _mm256_unpacklo_epi32(d0, d1);
+    __m256i t1  = _mm256_unpackhi_epi32(d0, d1);
+    __m256i t2  = _mm256_unpacklo_epi32(d2, d3);
+    __m256i t3  = _mm256_unpackhi_epi32(d2, d3);
+    __m256i s01 = _mm256_add_epi32(t0, t1);
+    __m256i s23 = _mm256_add_epi32(t2, t3);
+    return _mm256_add_epi32(_mm256_unpacklo_epi64(s01, s23),
+                            _mm256_unpackhi_epi64(s01, s23));
+}
+
+QMX_AVX2_TARGET
+static inline __m256 avx2_load_ymm2x4(float * const *dst4, uint32_t row_off,
+                                      uint32_t rem_rows, int accumulate) {
+    if (!accumulate) return _mm256_setzero_ps();
+    QMX_ALIGNED(32) float tmp[8];
+    for (uint32_t k = 0; k < 2u; k++) {
+        if (row_off + k < rem_rows) {
+            tmp[k * 4u + 0u] = dst4[0][row_off + k];
+            tmp[k * 4u + 1u] = dst4[1][row_off + k];
+            tmp[k * 4u + 2u] = dst4[2][row_off + k];
+            tmp[k * 4u + 3u] = dst4[3][row_off + k];
+        } else {
+            tmp[k * 4u + 0u] = 0.0f; tmp[k * 4u + 1u] = 0.0f;
+            tmp[k * 4u + 2u] = 0.0f; tmp[k * 4u + 3u] = 0.0f;
+        }
+    }
+    return _mm256_load_ps(tmp);
+}
+
+QMX_AVX2_TARGET
+static inline void avx2_store_ymm2x4(float * const *dst4, uint32_t row_off,
+                                     uint32_t rem_rows, __m256 acc) {
+    QMX_ALIGNED(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    for (uint32_t k = 0; k < 2u && row_off + k < rem_rows; k++) {
+        dst4[0][row_off + k] = tmp[k * 4u + 0u];
+        dst4[1][row_off + k] = tmp[k * 4u + 1u];
+        dst4[2][row_off + k] = tmp[k * 4u + 2u];
+        dst4[3][row_off + k] = tmp[k * 4u + 3u];
+    }
+}
+
+QMX_AVX2_TARGET
+static void avx2_matmul_q4_batch4(float * const *dst_batch,
+                                  int8_t * const *xq_eo_batch,
+                                  int32_t * const *xsums_batch,
+                                  float * const *xscales_batch,
+                                  const QmxTensor *w,
+                                  int accumulate,
+                                  int is_row_scaled) {
+    uint32_t orig_rows = w->rows;
+    uint32_t n_tr = (uint32_t)qmx_align_up(orig_rows, QMX_TILE_ROWS) / QMX_TILE_ROWS;
+    uint32_t n_tc = (uint32_t)qmx_align_up(w->cols, QMX_TILE_COLS) / QMX_TILE_COLS;
+    const uint8_t *base_data = (const uint8_t *)w->data;
+    const uint16_t *scales_f16 = (const uint16_t *)(const void *)w->scales;
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i mask0f = _mm256_set1_epi8(0x0F);
+
+    for (uint32_t tr = 0; tr < n_tr; tr++) {
+        uint32_t r_base = tr * QMX_TILE_ROWS;
+        uint32_t rem_rows = (r_base < orig_rows) ? (orig_rows - r_base) : 0u;
+        if (rem_rows > QMX_TILE_ROWS) rem_rows = QMX_TILE_ROWS;
+        float *dA[4] = { dst_batch[0] + r_base, dst_batch[1] + r_base, dst_batch[2] + r_base, dst_batch[3] + r_base };
+        uint32_t tbase = tr * n_tc;
+
+        for (uint32_t half = 0; half < 2u; half++) {
+            uint32_t h_lr = half * 8u;
+            if (rem_rows <= h_lr) break;
+
+            __m256 a0 = avx2_load_ymm2x4(dA, h_lr + 0u, rem_rows, accumulate);
+            __m256 a1 = avx2_load_ymm2x4(dA, h_lr + 2u, rem_rows, accumulate);
+            __m256 a2 = avx2_load_ymm2x4(dA, h_lr + 4u, rem_rows, accumulate);
+            __m256 a3 = avx2_load_ymm2x4(dA, h_lr + 6u, rem_rows, accumulate);
+
+            for (uint32_t tc = 0; tc < n_tc; tc++) {
+                uint32_t tid = tbase + tc;
+                const uint8_t *tp = base_data + (size_t)tid * 256u;
+                if (tc + 2u < n_tc) _mm_prefetch((const char *)(tp + 512u + h_lr * 16u), _MM_HINT_T0);
+
+                size_t eo_off = (size_t)tc * QMX_TILE_COLS;
+                const int8_t *e0 = xq_eo_batch[0] + eo_off;
+                const int8_t *e1 = xq_eo_batch[1] + eo_off;
+                const int8_t *e2 = xq_eo_batch[2] + eo_off;
+                const int8_t *e3 = xq_eo_batch[3] + eo_off;
+
+                __m256i bias8 = _mm256_broadcastsi128_si256(_mm_setr_epi32(
+                    xsums_batch[0][tc] * 8, xsums_batch[1][tc] * 8,
+                    xsums_batch[2][tc] * 8, xsums_batch[3][tc] * 8));
+                __m128 xs4 = _mm_setr_ps(
+                    xscales_batch[0][tc], xscales_batch[1][tc],
+                    xscales_batch[2][tc], xscales_batch[3][tc]);
+                __m256 xs8 = _mm256_insertf128_ps(_mm256_castps128_ps256(xs4), xs4, 1);
+
+                __m256 vws0, vws1, vws2, vws3;
+                if (is_row_scaled) {
+                    const uint16_t *rs = scales_f16 + (size_t)tid * QMX_TILE_ROWS + h_lr;
+                    __m128 s03 = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(rs + 0u)));
+                    __m128 s47 = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(rs + 4u)));
+                    vws0 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_shuffle_ps(s03, s03, 0x00)), _mm_shuffle_ps(s03, s03, 0x55), 1);
+                    vws1 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_shuffle_ps(s03, s03, 0xAA)), _mm_shuffle_ps(s03, s03, 0xFF), 1);
+                    vws2 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_shuffle_ps(s47, s47, 0x00)), _mm_shuffle_ps(s47, s47, 0x55), 1);
+                    vws3 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_shuffle_ps(s47, s47, 0xAA)), _mm_shuffle_ps(s47, s47, 0xFF), 1);
+                } else {
+                    vws0 = _mm256_set1_ps(w->scales[tid]);
+                    vws1 = vws0; vws2 = vws0; vws3 = vws0;
+                }
+
+                #define Q4_YMM_B4_PAIR(LR, VWS, ACC) do { \
+                    __m256i raw = _mm256_loadu_si256((const __m256i *)(tp + (LR) * 16u)); \
+                    __m256i lo  = _mm256_and_si256(raw, mask0f); \
+                    __m256i hi  = _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask0f); \
+                    __m256i p0 = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(lo, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e0 + 0u)))), _mm256_maddubs_epi16(hi, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e0 + 16u))))), ones16); \
+                    __m256i p1 = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(lo, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e1 + 0u)))), _mm256_maddubs_epi16(hi, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e1 + 16u))))), ones16); \
+                    __m256i p2 = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(lo, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e2 + 0u)))), _mm256_maddubs_epi16(hi, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e2 + 16u))))), ones16); \
+                    __m256i p3 = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(lo, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e3 + 0u)))), _mm256_maddubs_epi16(hi, _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(e3 + 16u))))), ones16); \
+                    __m256i s8 = _mm256_sub_epi32(avx2_reduce2x4_epi32(p0, p1, p2, p3), bias8); \
+                    ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s8), _mm256_mul_ps((VWS), xs8), ACC); \
+                } while (0)
+
+                Q4_YMM_B4_PAIR(h_lr + 0u, vws0, a0);
+                Q4_YMM_B4_PAIR(h_lr + 2u, vws1, a1);
+                Q4_YMM_B4_PAIR(h_lr + 4u, vws2, a2);
+                Q4_YMM_B4_PAIR(h_lr + 6u, vws3, a3);
+                #undef Q4_YMM_B4_PAIR
+            }
+
+            avx2_store_ymm2x4(dA, h_lr + 0u, rem_rows, a0);
+            avx2_store_ymm2x4(dA, h_lr + 2u, rem_rows, a1);
+            avx2_store_ymm2x4(dA, h_lr + 4u, rem_rows, a2);
+            avx2_store_ymm2x4(dA, h_lr + 6u, rem_rows, a3);
+        }
+    }
+}
+
+QMX_AVX2_TARGET
+static void avx2_matmul_q8_batch4(float * const *dst_batch,
+                                  int8_t * const *xq_batch,
+                                  float * const *xscales_batch,
+                                  const QmxTensor *w,
+                                  int accumulate,
+                                  int is_row_scaled) {
+    uint32_t orig_rows = w->rows;
+    uint32_t n_tr = (uint32_t)qmx_align_up(orig_rows, QMX_TILE_ROWS) / QMX_TILE_ROWS;
+    uint32_t n_tc = (uint32_t)qmx_align_up(w->cols, QMX_TILE_COLS) / QMX_TILE_COLS;
+    const uint8_t *base_data = (const uint8_t *)w->data;
+    const uint16_t *scales_f16 = (const uint16_t *)(const void *)w->scales;
+    __m256i ones16 = _mm256_set1_epi16(1);
+
+    QMX_ALIGNED(32) float tile_acc[4][QMX_TILE_ROWS];
+
+    for (uint32_t tr = 0; tr < n_tr; tr++) {
+        uint32_t r_base = tr * QMX_TILE_ROWS;
+        uint32_t rem_rows = (r_base < orig_rows) ? (orig_rows - r_base) : 0u;
+        if (rem_rows > QMX_TILE_ROWS) rem_rows = QMX_TILE_ROWS;
+
+        for (int b = 0; b < 4; b++) {
+            for (uint32_t lr = 0; lr < QMX_TILE_ROWS; lr++) {
+                tile_acc[b][lr] = (accumulate && lr < rem_rows) ? dst_batch[b][r_base + lr] : 0.0f;
+            }
+        }
+
+        uint32_t tbase = tr * n_tc;
+        for (uint32_t tc_blk = 0; tc_blk < n_tc; tc_blk += 32u) {
+            uint32_t tc_end = tc_blk + 32u;
+            if (tc_end > n_tc) tc_end = n_tc;
+
+            for (uint32_t g = 0; g < 4u; g++) {
+                uint32_t lr = g * 4u;
+                if (rem_rows <= lr) break;
+
+                __m128 va0 = _mm_load_ps(tile_acc[0] + lr);
+                __m128 va1 = _mm_load_ps(tile_acc[1] + lr);
+                __m128 va2 = _mm_load_ps(tile_acc[2] + lr);
+                __m128 va3 = _mm_load_ps(tile_acc[3] + lr);
+
+                for (uint32_t tc = tc_blk; tc < tc_end; tc++) {
+                    uint32_t tid = tbase + tc;
+                    const uint8_t *tp = base_data + (size_t)tid * 512u;
+                    __m128 ws = is_row_scaled
+                              ? _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(scales_f16 + (size_t)tid * QMX_TILE_ROWS + lr)))
+                              : _mm_set1_ps(w->scales[tid]);
+
+                    size_t x_off = (size_t)tc * QMX_TILE_COLS;
+                    #define AVX2_Q8_B4_STEP(B_IDX, VA_REG) do { \
+                        __m256i vx = _mm256_loadu_si256((const __m256i *)(xq_batch[B_IDX] + x_off)); \
+                        __m256i r0 = avx2_dot_q8_row(tp, lr + 0u, vx, ones16); \
+                        __m256i r1 = avx2_dot_q8_row(tp, lr + 1u, vx, ones16); \
+                        __m256i r2 = avx2_dot_q8_row(tp, lr + 2u, vx, ones16); \
+                        __m256i r3 = avx2_dot_q8_row(tp, lr + 3u, vx, ones16); \
+                        VA_REG = _mm_fmadd_ps(_mm_cvtepi32_ps(avx2_hsum4_epi32(r0, r1, r2, r3)), _mm_mul_ps(ws, _mm_set1_ps(xscales_batch[B_IDX][tc])), VA_REG); \
+                    } while (0)
+
+                    AVX2_Q8_B4_STEP(0, va0);
+                    AVX2_Q8_B4_STEP(1, va1);
+                    AVX2_Q8_B4_STEP(2, va2);
+                    AVX2_Q8_B4_STEP(3, va3);
+                    #undef AVX2_Q8_B4_STEP
+                }
+
+                _mm_store_ps(tile_acc[0] + lr, va0);
+                _mm_store_ps(tile_acc[1] + lr, va1);
+                _mm_store_ps(tile_acc[2] + lr, va2);
+                _mm_store_ps(tile_acc[3] + lr, va3);
+            }
+        }
+
+        for (int b = 0; b < 4; b++) {
+            if (rem_rows == QMX_TILE_ROWS) {
+                _mm_storeu_ps(dst_batch[b] + r_base + 0u,  _mm_load_ps(tile_acc[b] + 0u));
+                _mm_storeu_ps(dst_batch[b] + r_base + 4u,  _mm_load_ps(tile_acc[b] + 4u));
+                _mm_storeu_ps(dst_batch[b] + r_base + 8u,  _mm_load_ps(tile_acc[b] + 8u));
+                _mm_storeu_ps(dst_batch[b] + r_base + 12u, _mm_load_ps(tile_acc[b] + 12u));
+            } else {
+                for (uint32_t lr = 0; lr < rem_rows; lr++) dst_batch[b][r_base + lr] = tile_acc[b][lr];
+            }
+        }
+    }
+}
+
+QMX_AVX2_TARGET
+static void avx2_matmul_tiled_batch(float   * const *dst_batch,
+                                    int8_t  * const *xq_batch,
+                                    int8_t  * const *xq_eo_batch,
+                                    int32_t * const *xsums_batch,
+                                    float   * const *xscales_batch,
+                                    int batch_size,
+                                    const QmxTensor *w,
+                                    int accumulate) {
+    uint8_t qt = w->quant_type;
+    int is_q4 = (qt == QMX_QUANT_Q4_SYM || qt == QMX_QUANT_Q4_ROW32);
+    int is_q8 = (qt == QMX_QUANT_Q8_SYM || qt == QMX_QUANT_Q8_ROW32);
+    int is_rs = (qt == QMX_QUANT_Q4_ROW32 || qt == QMX_QUANT_Q8_ROW32);
+
+    int b = 0;
+    if (is_q4 && xq_eo_batch && xsums_batch) {
+        while (b + 4 <= batch_size) {
+            if (xq_eo_batch[b] && xq_eo_batch[b + 1] && xq_eo_batch[b + 2] && xq_eo_batch[b + 3] &&
+                xsums_batch[b] && xsums_batch[b + 1] && xsums_batch[b + 2] && xsums_batch[b + 3]) {
+                avx2_matmul_q4_batch4(dst_batch + b, xq_eo_batch + b, xsums_batch + b,
+                                      xscales_batch + b, w, accumulate, is_rs);
+                b += 4;
+            } else {
+                break;
+            }
+        }
+    } else if (is_q8) {
+        while (b + 4 <= batch_size) {
+            avx2_matmul_q8_batch4(dst_batch + b, xq_batch + b, xscales_batch + b,
+                                  w, accumulate, is_rs);
+            b += 4;
+        }
+    }
+
+    for (; b < batch_size; b++) {
+        if (xq_eo_batch && xsums_batch && xq_eo_batch[b] && xsums_batch[b]) {
+            avx2_matmul_tiled_eo(dst_batch[b], xq_batch[b], xq_eo_batch[b], xsums_batch[b],
+                                 xscales_batch[b], w, accumulate);
+        } else {
+            avx2_matmul_tiled(dst_batch[b], xq_batch[b], NULL, xscales_batch[b], w, accumulate);
+        }
+    }
+    QMX_MSVC_ZEROUPPER();
 }
 
 QMX_AVX2_TARGET
@@ -624,6 +936,7 @@ static void avx2_rmsnorm(float       * QMX_RESTRICT out,
         __m256 vw = _mm256_loadu_ps(weight + i);
         _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_mul_ps(vx, v_inv), vw));
     }
+    QMX_MSVC_ZEROUPPER();
     for (; i < size; i++) out[i] = weight[i] * (inv_rms * x[i]);
 }
 
@@ -639,6 +952,7 @@ static float avx2_dot_f32(const float * QMX_RESTRICT a,
         sum8 = _mm256_fmadd_ps(va, vb, sum8);
     }
     float sum = avx2_hsum_ps(sum8);
+    QMX_MSVC_ZEROUPPER();
     for (; i < n; i++) sum += a[i] * b[i];
     return sum;
 }
@@ -655,6 +969,7 @@ static void avx2_saxpy_f32(float       * QMX_RESTRICT y,
         __m256 vx = _mm256_loadu_ps(x + i);
         _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, vx, vy));
     }
+    QMX_MSVC_ZEROUPPER();
     for (; i < n; i++) y[i] += a * x[i];
 }
 
@@ -675,6 +990,7 @@ static int32_t avx2_dot_q8(const int8_t  * QMX_RESTRICT q8,
         acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(aq, sk), ones16));
     }
     int32_t sum = avx2_hsum_epi32(acc);
+    QMX_MSVC_ZEROUPPER();
     for (; i < n; i++) sum += (int32_t)q8[i] * (int32_t)k8[i];
     return sum;
 }
@@ -760,6 +1076,7 @@ static void avx2_rmsnorm_quant(const float * QMX_RESTRICT x,
         avx2_quant_group32(v0, v1, v2, v3, xq + base, &x_scales[g]);
     }
 
+    QMX_MSVC_ZEROUPPER();
     uint32_t tail_base = full_groups * QMX_TILE_COLS;
     if (tail_base < size) {
         uint32_t rem = size - tail_base;
@@ -811,6 +1128,7 @@ static void avx2_swiglu_quant(const float * QMX_RESTRICT gate,
         avx2_quant_group32(v0, v1, v2, v3, xq + base, &x_scales[g]);
     }
 
+    QMX_MSVC_ZEROUPPER();
     uint32_t tail_base = full_groups * QMX_TILE_COLS;
     if (tail_base < size) {
         uint32_t rem = size - tail_base;
@@ -830,6 +1148,7 @@ static void avx2_f16_to_f32(float * QMX_RESTRICT dst, const uint16_t * QMX_RESTR
         __m128i h8 = _mm_loadu_si128((const __m128i *)(src + i));
         _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(h8));
     }
+    QMX_MSVC_ZEROUPPER();
     if (i + 3u < n) {
         __m128i h4 = _mm_loadl_epi64((const __m128i *)(src + i));
         _mm_storeu_ps(dst + i, _mm_cvtph_ps(h4));
@@ -845,12 +1164,58 @@ static void avx2_f32_to_f16(uint16_t * QMX_RESTRICT dst, const float * QMX_RESTR
         __m256 v8 = _mm256_loadu_ps(src + i);
         _mm_storeu_si128((__m128i *)(dst + i), _mm256_cvtps_ph(v8, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
     }
+    QMX_MSVC_ZEROUPPER();
     if (i + 3u < n) {
         __m128 v4 = _mm_loadu_ps(src + i);
         _mm_storel_epi64((__m128i *)(dst + i), _mm_cvtps_ph(v4, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
         i += 4u;
     }
     for (; i < n; i++) dst[i] = qmx_fp32_to_fp16(src[i]);
+}
+
+QMX_AVX2_TARGET
+static float avx2_dot_f32_f16(const float * QMX_RESTRICT a,
+                              const uint16_t * QMX_RESTRICT b,
+                              uint32_t n) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 15u < n; i += 16u) {
+        __m256 vb0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + i)));
+        __m256 vb1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + i + 8u)));
+        sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), vb0, sum0);
+        sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8u), vb1, sum1);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    for (; i + 7u < n; i += 8u) {
+        __m256 vb = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + i)));
+        sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), vb, sum0);
+    }
+    float sum = avx2_hsum_ps(sum0);
+    QMX_MSVC_ZEROUPPER();
+    for (; i < n; i++) sum += a[i] * qmx_fp16_to_fp32(b[i]);
+    return sum;
+}
+
+QMX_AVX2_TARGET
+static void avx2_saxpy_f32_f16(float * QMX_RESTRICT y,
+                               float a,
+                               const uint16_t * QMX_RESTRICT x,
+                               uint32_t n) {
+    __m256 va = _mm256_set1_ps(a);
+    uint32_t i = 0;
+    for (; i + 15u < n; i += 16u) {
+        __m256 vx0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i)));
+        __m256 vx1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i + 8u)));
+        _mm256_storeu_ps(y + i,      _mm256_fmadd_ps(va, vx0, _mm256_loadu_ps(y + i)));
+        _mm256_storeu_ps(y + i + 8u, _mm256_fmadd_ps(va, vx1, _mm256_loadu_ps(y + i + 8u)));
+    }
+    for (; i + 7u < n; i += 8u) {
+        __m256 vx = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i)));
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, vx, _mm256_loadu_ps(y + i)));
+    }
+    QMX_MSVC_ZEROUPPER();
+    for (; i < n; i++) y[i] += a * qmx_fp16_to_fp32(x[i]);
 }
 
 const QmxBackendOps qmx_ops_avx2 = {
@@ -864,6 +1229,11 @@ const QmxBackendOps qmx_ops_avx2 = {
     avx2_rmsnorm_quant,
     avx2_swiglu_quant,
     avx2_f16_to_f32,
-    avx2_f32_to_f16
+    avx2_f32_to_f16,
+    avx2_prepare_act_eo,
+    avx2_matmul_tiled_eo,
+    avx2_matmul_tiled_batch,
+    avx2_dot_f32_f16,
+    avx2_saxpy_f32_f16
 };
 #endif
