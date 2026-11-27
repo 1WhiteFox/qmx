@@ -811,7 +811,7 @@ static void qmx_model_matmul_batch(QmxModel *model,
                 } else {
                     ops->matmul_tiled(dst_batch[b] + r_base,
                                       xq_batch[b] + col_start,
-                                      xq16_batch[b] + col_start,
+                                      (xq16_batch && xq16_batch[b]) ? (xq16_batch[b] + col_start) : NULL,
                                       xscales_batch[b] + tc_start,
                                       &sub_w, sub_acc);
                 }

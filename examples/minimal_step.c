@@ -37,6 +37,7 @@ int main(int argc, char **argv) {
     int has_tok = 0;
     uint8_t *file_buf = NULL;
     uint8_t *ext_arena = NULL;
+    MemReaderCtx mctx = { NULL, 0u };
 
     QmxLoadParams lp = qmx_load_params_default();
     lp.override_max_seq = 128u;
@@ -55,7 +56,8 @@ int main(int argc, char **argv) {
         }
         fclose(fp);
 
-        MemReaderCtx mctx = { file_buf, (uint64_t)fsz };
+        mctx.data = file_buf;
+        mctx.size = (uint64_t)fsz;
         QmxReader reader  = { mem_read, NULL, &mctx, (uint64_t)fsz };
         lp.force_stream   = 1;
         lp.max_ram_bytes  = 49152u;

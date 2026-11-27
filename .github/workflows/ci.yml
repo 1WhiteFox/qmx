@@ -75,7 +75,7 @@ jobs:
       - name: Install AArch64 cross-compiler & QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static python3-numpy
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user python3-numpy
 
       - name: Build ARM64 NEON + DotProd & run tests under QEMU
         run: |
@@ -88,10 +88,11 @@ jobs:
           for t in test_ops test_vm test_simd test_xip_15k; do
             aarch64-linux-gnu-gcc -std=c99 -Wall -Wextra -Iinclude -fno-builtin -DQMX_ENABLE_THREADS -pthread -O2 -static tests/$t.c build/arm64/qmx_arm64.o -lm -o build/arm64/$t
           done
-          qemu-aarch64-static build/arm64/test_ops
-          qemu-aarch64-static build/arm64/test_vm test_q4.qmx
-          qemu-aarch64-static build/arm64/test_simd test_q4.qmx
-          qemu-aarch64-static build/arm64/test_xip_15k
+          QEMU_BIN=$(command -v qemu-aarch64-static || command -v qemu-aarch64)
+          $QEMU_BIN -cpu max build/arm64/test_ops
+          $QEMU_BIN -cpu max build/arm64/test_vm test_q4.qmx
+          $QEMU_BIN -cpu max build/arm64/test_simd test_q4.qmx
+          $QEMU_BIN -cpu max build/arm64/test_xip_15k
 
   windows-msvc:
     name: Windows x64 (MSVC /arch:SSE2 multi-ISA)
